@@ -164,8 +164,7 @@ void tud_connect(void);
 
 // ── Watchdog thresholds ──
 #define BOOT_GRACE_MS 5000      // USB enumeration grace period after boot
-#define ESPNOW_TIMEOUT_MS 3400  // no packets from CoreS3 → restart
-#define USB_STUCK_MS 4000       // USB unhealthy while active → restart
+#define ESPNOW_TIMEOUT_MS 3400  // no packets from CoreS3 → esp_now_deinit
 
 static uint32_t usbGoneSinceMs = 0;
 #define USB_GONE_REPLUG_MS 30000
