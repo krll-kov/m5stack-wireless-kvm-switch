@@ -2355,4 +2355,4 @@ The CoreS3 SE acts as the central hub: it reads the USB mouse dongle and BLE key
 
 ## 📜 License
 
-MIT
+[GPL-3.0-1](https://github.com/krll-kov/m5stack-wireless-kvm-switch?tab=GPL-3.0-1-ov-file#readme)
