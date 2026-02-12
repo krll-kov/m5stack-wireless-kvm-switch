@@ -997,29 +997,10 @@ static uint8_t epAddr = 0, hidIfNum = 0;
 static volatile bool devGone = false, xferDead = false;
 static uint32_t xferDeadMs = 0;
 static volatile uint32_t lastXferCbMs = 0;
+static int recoverFails = 0;
+static volatile bool usbResetRequest = false;
 
-static bool softRecoverUsb() {
-  if (!usbDev) return false;
-  if (xferIn) {
-    usb_host_transfer_free(xferIn);
-    xferIn = NULL;
-  }
-  if (epAddr) {
-    usb_host_interface_release(usbClient, usbDev, hidIfNum);
-    epAddr = 0;
-  }
-  usbMouseReady = false;
-  xferDead = false;
-  xferDeadMs = 0;
-  vTaskDelay(pdMS_TO_TICKS(100));
-  if (findHidEp()) {
-    usbMouseReady = true;
-    lastXferCbMs = millis();
-    needRedraw = true;
-    return true;
-  }
-  return false;
-}
+static bool findHidEp();
 
 static void mouseXferCb(usb_transfer_t *xfer) {
   lastXferCbMs = millis();
@@ -1035,15 +1016,11 @@ static void mouseXferCb(usb_transfer_t *xfer) {
     int len = xfer->actual_num_bytes;
     mouse_evt_t evt = {};
     if (len == 4) {
-      evt.buttons = d[0];
-      evt.x = (int8_t)d[1];
-      evt.y = (int8_t)d[2];
-      evt.wheel = (int8_t)d[3];
+      evt.buttons = d[0]; evt.x = (int8_t)d[1];
+      evt.y = (int8_t)d[2]; evt.wheel = (int8_t)d[3];
     } else if (len == 5) {
-      evt.buttons = d[1];
-      evt.x = (int8_t)d[2];
-      evt.y = (int8_t)d[3];
-      evt.wheel = (int8_t)d[4];
+      evt.buttons = d[1]; evt.x = (int8_t)d[2];
+      evt.y = (int8_t)d[3]; evt.wheel = (int8_t)d[4];
     } else if (len == 6) {
       evt.buttons = d[0];
       evt.x = (int16_t)(d[1] | (d[2] << 8));
@@ -1057,23 +1034,29 @@ static void mouseXferCb(usb_transfer_t *xfer) {
     }
     xQueueSend(mouseQueue, &evt, 0);
   }
-  if (xfer->status == USB_TRANSFER_STATUS_NO_DEVICE ||
-      xfer->status == USB_TRANSFER_STATUS_CANCELED) {
+
+  if (xfer->status != USB_TRANSFER_STATUS_COMPLETED) {
     xferDead = true;
     return;
   }
+
   if (usbDev && xferIn) {
     if (usb_host_transfer_submit(xferIn) != ESP_OK) xferDead = true;
   } else
     xferDead = true;
 }
+
 static void usbEventCb(const usb_host_client_event_msg_t *msg, void *) {
   if (msg->event == USB_HOST_CLIENT_EVENT_NEW_DEV) {
-    if (!usbDev) usb_host_device_open(usbClient, msg->new_dev.address, &usbDev);
+    if (!usbDev)
+      usb_host_device_open(usbClient, msg->new_dev.address, &usbDev);
   } else if (msg->event == USB_HOST_CLIENT_EVENT_DEV_GONE)
     devGone = true;
 }
+
 static void cleanupUsb() {
+  usbMouseReady = false;
+  usb_host_client_handle_events(usbClient, 10);
   if (xferIn) {
     usb_host_transfer_free(xferIn);
     xferIn = NULL;
@@ -1084,66 +1067,90 @@ static void cleanupUsb() {
     usbDev = NULL;
   }
   epAddr = 0;
-  usbMouseReady = false;
   xferDead = false;
   xferDeadMs = 0;
+  lastXferCbMs = 0;
   usb_host_lib_handle_events(10, NULL);
 }
 
+static void fullUsbReset() {
+  usbMouseReady = false;
+  xferDead = false;
+  xferDeadMs = 0;
+  lastXferCbMs = 0;
+  devGone = false;
+  recoverFails = 0;
 
-void usbHostTask(void *) {
+  if (epAddr && usbDev) {
+    usb_host_endpoint_halt(usbDev, epAddr);
+    usb_host_endpoint_flush(usbDev, epAddr);
+    vTaskDelay(pdMS_TO_TICKS(60));
+    usb_host_client_handle_events(usbClient, 20);
+  }
+  if (xferIn) {
+    usb_host_transfer_free(xferIn);
+    xferIn = NULL;
+  }
+  if (usbDev) {
+    if (epAddr) usb_host_interface_release(usbClient, usbDev, hidIfNum);
+    usb_host_device_close(usbClient, usbDev);
+    usbDev = NULL;
+  }
+  epAddr = 0;
+
+  if (usbClient) {
+    usb_host_client_deregister(usbClient);
+    usbClient = NULL;
+  }
+  for (int i = 0; i < 5; i++)
+    usb_host_lib_handle_events(20, NULL);
+  usb_host_uninstall();
+
+  vTaskDelay(pdMS_TO_TICKS(500));
+
   usb_host_config_t hc = {};
   hc.skip_phy_setup = false;
   hc.intr_flags = ESP_INTR_FLAG_LEVEL1;
   usb_host_install(&hc);
+
   usb_host_client_config_t cc = {};
   cc.is_synchronous = false;
   cc.max_num_event_msg = 5;
   cc.async.client_event_callback = usbEventCb;
   usb_host_client_register(&cc, &usbClient);
-  while (true) {
-    usb_host_lib_handle_events(1, NULL);
-    usb_host_client_handle_events(usbClient, 0);
-    if (devGone) {
-      devGone = false;
-      cleanupUsb();
-      needRedraw = true;
-    }
 
-    if (xferDead && usbDev) {
-      if (!xferDeadMs) xferDeadMs = millis();
-      uint32_t deadElapsed = millis() - xferDeadMs;
-      if (deadElapsed > 6000) {
-        if (!softRecoverUsb()) {
-          cleanupUsb(); 
-          needRedraw = true;
-        }
-      } else {
-        vTaskDelay(pdMS_TO_TICKS(50));
-        if (xferIn && usb_host_transfer_submit(xferIn) == ESP_OK) {
-          xferDead = false;
-          xferDeadMs = 0;
-          lastXferCbMs = millis();
-        }
-      }
-    }
+  needRedraw = true;
+}
 
-    if (usbDev && !epAddr) {
-      vTaskDelay(pdMS_TO_TICKS(200));
-      if (findHidEp()) {
-        usbMouseReady = true;
-        needRedraw = true;
-      }
-    }
+static bool softRecoverUsb() {
+  if (!usbDev) return false;
 
-    if (usbMouseReady && epAddr && usbDev && !xferDead &&
-        lastXferCbMs > 0 && (millis() - lastXferCbMs > 5000)) {
-      softRecoverUsb();
-      needRedraw = true;
-    }
-
-    vTaskDelay(pdMS_TO_TICKS(1));
+  if (xferIn) {
+    usb_host_transfer_free(xferIn);
+    xferIn = NULL;
   }
+  if (epAddr) {
+    usb_host_interface_release(usbClient, usbDev, hidIfNum);
+    epAddr = 0;
+  }
+  usbMouseReady = false;
+  xferDead = false;
+  xferDeadMs = 0;
+  lastXferCbMs = 0;
+
+  if (devGone) return false;
+  vTaskDelay(pdMS_TO_TICKS(200));
+  if (devGone) return false;
+
+  if (findHidEp()) {
+    usbMouseReady = true;
+    lastXferCbMs = millis();
+    recoverFails = 0;
+    needRedraw = true;
+    return true;
+  }
+  recoverFails++;
+  return false;
 }
 
 static bool findHidEp() {
@@ -1190,6 +1197,64 @@ static bool findHidEp() {
     off += dL;
   }
   return false;
+}
+
+void usbHostTask(void *) {
+  usb_host_config_t hc = {};
+  hc.skip_phy_setup = false;
+  hc.intr_flags = ESP_INTR_FLAG_LEVEL1;
+  usb_host_install(&hc);
+  usb_host_client_config_t cc = {};
+  cc.is_synchronous = false;
+  cc.max_num_event_msg = 5;
+  cc.async.client_event_callback = usbEventCb;
+  usb_host_client_register(&cc, &usbClient);
+
+  while (true) {
+    usb_host_lib_handle_events(1, NULL);
+    usb_host_client_handle_events(usbClient, 0);
+
+    if (usbResetRequest || recoverFails >= 3) {
+      usbResetRequest = false;
+      fullUsbReset();
+      continue;
+    }
+
+    if (devGone) {
+      devGone = false;
+      cleanupUsb();
+      needRedraw = true;
+    }
+
+    if (xferDead && usbDev) {
+      if (!xferDeadMs) xferDeadMs = millis();
+      uint32_t deadElapsed = millis() - xferDeadMs;
+      if (deadElapsed > 6000) {
+        if (!softRecoverUsb()) {
+          cleanupUsb();
+          needRedraw = true;
+        }
+      } else {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        if (xferIn && usb_host_transfer_submit(xferIn) == ESP_OK) {
+          xferDead = false;
+          xferDeadMs = 0;
+          lastXferCbMs = millis();
+        }
+      }
+    }
+
+    if (usbDev && !epAddr) {
+      vTaskDelay(pdMS_TO_TICKS(200));
+      if (findHidEp()) {
+        usbMouseReady = true;
+        recoverFails = 0;
+        needRedraw = true;
+      }
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
 }
 
 // ===================== MOUSE SEND TASK =====================
@@ -1585,6 +1650,7 @@ static bool bleDoConnect() {
   bleKbdConnected = true;
   bleState = 4;
   passkeyActive = false;
+  usbResetRequest = true;
   needRedraw = true;
   while (c->isConnected()) vTaskDelay(pdMS_TO_TICKS(500));
   bleKbdConnected = false;
@@ -1764,6 +1830,7 @@ void bleTask(void *) {
 
     strncpy(rtcDbg, "pre-mouseOnly", sizeof(rtcDbg));
     probesDone = true;
+    usbResetRequest = true;
   }
 }
 
