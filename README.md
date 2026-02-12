@@ -855,7 +855,6 @@ static bool mxEnumerateBt() {
     }
     if (dT == 0x05 && dL >= 7 && (isBtIf || isBtDev)) {
       uint8_t ea = buf[off + 2], et = buf[off + 3] & 0x03;
-      uint16_t mps = buf[off + 4] | (buf[off + 5] << 8);
       if (et == 0x03 && (ea & 0x80) && !mxBtEvtEp) mxBtEvtEp = ea & 0x0F;
     }
     off += dL;
@@ -997,12 +996,38 @@ static usb_transfer_t *xferIn = NULL;
 static uint8_t epAddr = 0, hidIfNum = 0;
 static volatile bool devGone = false, xferDead = false;
 static uint32_t xferDeadMs = 0;
+static volatile uint32_t lastXferCbMs = 0;
+
+static bool softRecoverUsb() {
+  if (!usbDev) return false;
+  if (xferIn) {
+    usb_host_transfer_free(xferIn);
+    xferIn = NULL;
+  }
+  if (epAddr) {
+    usb_host_interface_release(usbClient, usbDev, hidIfNum);
+    epAddr = 0;
+  }
+  usbMouseReady = false;
+  xferDead = false;
+  xferDeadMs = 0;
+  vTaskDelay(pdMS_TO_TICKS(100));
+  if (findHidEp()) {
+    usbMouseReady = true;
+    lastXferCbMs = millis();
+    needRedraw = true;
+    return true;
+  }
+  return false;
+}
 
 static void mouseXferCb(usb_transfer_t *xfer) {
+  lastXferCbMs = millis();
   if (switchInProgress) {
     if (usbDev && xferIn) usb_host_transfer_submit(xferIn);
     return;
   }
+
   if (xfer->status == USB_TRANSFER_STATUS_COMPLETED &&
       xfer->actual_num_bytes > 0) {
     lastActivityMs = millis();
@@ -1064,6 +1089,63 @@ static void cleanupUsb() {
   xferDeadMs = 0;
   usb_host_lib_handle_events(10, NULL);
 }
+
+
+void usbHostTask(void *) {
+  usb_host_config_t hc = {};
+  hc.skip_phy_setup = false;
+  hc.intr_flags = ESP_INTR_FLAG_LEVEL1;
+  usb_host_install(&hc);
+  usb_host_client_config_t cc = {};
+  cc.is_synchronous = false;
+  cc.max_num_event_msg = 5;
+  cc.async.client_event_callback = usbEventCb;
+  usb_host_client_register(&cc, &usbClient);
+  while (true) {
+    usb_host_lib_handle_events(1, NULL);
+    usb_host_client_handle_events(usbClient, 0);
+    if (devGone) {
+      devGone = false;
+      cleanupUsb();
+      needRedraw = true;
+    }
+
+    if (xferDead && usbDev) {
+      if (!xferDeadMs) xferDeadMs = millis();
+      uint32_t deadElapsed = millis() - xferDeadMs;
+      if (deadElapsed > 6000) {
+        if (!softRecoverUsb()) {
+          cleanupUsb(); 
+          needRedraw = true;
+        }
+      } else {
+        vTaskDelay(pdMS_TO_TICKS(50));
+        if (xferIn && usb_host_transfer_submit(xferIn) == ESP_OK) {
+          xferDead = false;
+          xferDeadMs = 0;
+          lastXferCbMs = millis();
+        }
+      }
+    }
+
+    if (usbDev && !epAddr) {
+      vTaskDelay(pdMS_TO_TICKS(200));
+      if (findHidEp()) {
+        usbMouseReady = true;
+        needRedraw = true;
+      }
+    }
+
+    if (usbMouseReady && epAddr && usbDev && !xferDead &&
+        lastXferCbMs > 0 && (millis() - lastXferCbMs > 5000)) {
+      softRecoverUsb();
+      needRedraw = true;
+    }
+
+    vTaskDelay(pdMS_TO_TICKS(1));
+  }
+}
+
 static bool findHidEp() {
   if (!usbDev) return false;
   const usb_config_desc_t *cfg;
@@ -1101,53 +1183,13 @@ static bool findHidEp() {
         epAddr = a;
         xferDead = false;
         xferDeadMs = 0;
+        lastXferCbMs = millis();
         return true;
       }
     }
     off += dL;
   }
   return false;
-}
-void usbHostTask(void *) {
-  usb_host_config_t hc = {};
-  hc.skip_phy_setup = false;
-  hc.intr_flags = ESP_INTR_FLAG_LEVEL1;
-  usb_host_install(&hc);
-  usb_host_client_config_t cc = {};
-  cc.is_synchronous = false;
-  cc.max_num_event_msg = 5;
-  cc.async.client_event_callback = usbEventCb;
-  usb_host_client_register(&cc, &usbClient);
-  while (true) {
-    usb_host_lib_handle_events(1, NULL);
-    usb_host_client_handle_events(usbClient, 0);
-    if (devGone) {
-      devGone = false;
-      cleanupUsb();
-      needRedraw = true;
-    }
-    if (xferDead && usbDev && xferIn) {
-      if (!xferDeadMs) xferDeadMs = millis();
-      if (millis() - xferDeadMs > 3000) {
-        cleanupUsb();
-        needRedraw = true;
-      } else {
-        vTaskDelay(pdMS_TO_TICKS(50));
-        if (usb_host_transfer_submit(xferIn) == ESP_OK) {
-          xferDead = false;
-          xferDeadMs = 0;
-        }
-      }
-    }
-    if (usbDev && !epAddr) {
-      vTaskDelay(pdMS_TO_TICKS(200));
-      if (findHidEp()) {
-        usbMouseReady = true;
-        needRedraw = true;
-      }
-    }
-    vTaskDelay(pdMS_TO_TICKS(1));
-  }
 }
 
 // ===================== MOUSE SEND TASK =====================
