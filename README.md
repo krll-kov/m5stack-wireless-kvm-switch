@@ -170,6 +170,9 @@ void tud_connect(void);
 static uint32_t usbGoneSinceMs = 0;
 #define USB_GONE_REPLUG_MS 30000
 
+#define USB_IDLE_TIMEOUT_MS 60000
+#define USB_IDLE_DELAY_MS   250
+
 USBHIDKeyboard UsbKbd;
 USBHIDMouse UsbMouse;
 
@@ -247,6 +250,8 @@ static inline bool ensureUsbAwake() {
     return tud_mounted();
 }
 
+static uint32_t lastInputMs = 0;
+
 void usbTask(void *pvParameters) {
   MousePkt p;
   KbdPkt k;
@@ -271,11 +276,15 @@ void usbTask(void *pvParameters) {
         UsbMouse.release(MOUSE_LEFT | MOUSE_RIGHT | MOUSE_MIDDLE);
         prevBtn = 0;
         deviceActive = true;
+        lastInputMs = millis();
       }
     }
 
+    bool hasActivity = false;
     while (deviceActive && xQueueReceive(mouseQ, &p, 0) == pdTRUE) {
+      hasActivity = true;
       if (!ensureUsbAwake()) break;
+    
       int16_t rx = p.dx;
       int16_t ry = p.dy;
       int8_t rw = p.whl;
@@ -301,20 +310,27 @@ void usbTask(void *pvParameters) {
     }
 
     while (deviceActive && xQueueReceive(kbdQ, &k, 0) == pdTRUE) {
+      hasActivity = true;
       if (!ensureUsbAwake()) break;
+
       KeyReport rpt;
       rpt.modifiers = k.mod;
       rpt.reserved = 0;
       memcpy(rpt.keys, k.keys, 6);
       UsbKbd.sendReport(&rpt);
     }
+    if (hasActivity) lastInputMs = millis();
 
     if (!deviceActive) {
       vTaskDelay(100);
       xQueueReset(mouseQ);
       xQueueReset(kbdQ);
     } else {
-      taskYIELD();
+      if (millis() - lastInputMs > USB_IDLE_TIMEOUT_MS) {
+          vTaskDelay(pdMS_TO_TICKS(USB_IDLE_DELAY_MS));
+      } else {
+        taskYIELD();
+      }
     }
   }
 }
