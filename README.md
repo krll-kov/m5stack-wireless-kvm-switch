@@ -1,50 +1,98 @@
-# m5stack-wireless-kvm-switch
-Wireless keyboard and mouse kvm switch (both IN and OUT) based on M5Stack CoreS3 SE and Atom S3U that can handle 1000 Hz wireless mouse and blueooth keyboard
+# 🖱️⌨️ M5Stack Wireless KVM Switch
 
-Setup used in this guide:
-	- M5GO/FIRE Battery Bottom Charging Base × 1
-	- AtomS3U ESP32S3 Development Kit with USB-A × 2
-	- M5GO Battery Bottom3 (for CoreS3 only) × 1
-	- M5Stack CoreS3 SE IoT Controller without Battery Bottom × 1
-  - M5Stack USB Module V1.2 - for M5Core × 1 (For legacy bluetooth connections)
-  - Bluetooth 4.0 USB Module × 1 (For legacy bluetooth connections)
-  - M3x25 DIN 912 A2 × 2 (to connect battery base + cores3 se + USB Module)
-  - M3x22 DIN 912 A2 × 2 (to connect battery base + cores3 se + USB Module)
+> Wireless keyboard & mouse KVM switch (**both IN and OUT**) based on M5Stack CoreS3 SE and Atom S3U — capable of handling a **1000 Hz wireless mouse** and **Bluetooth keyboard**.
 
-  - Apple magic keyboard (wireless with usb-c support 2021) × 1
-  - Keychrone m3 mini with wireless usb-c dongle × 1
+Switch between two PCs with a single mouse button press. No cables for peripherals, no lag.
 
+---
 
-Setup guide (I'm using MacOS so it will be for Mac), but can be used on other OS, just download files for your OS:
-- Install Arduino IDE: https://www.arduino.cc/en/software
-- Insert Atom S3U (usb thing that looks like a flash drive) into MAC 
-- Install USB Driver: https://docs.m5stack.com/en/download (I used pkg, did not reboot the system, just opened installer, clicked yes according to guide in repo)
-<img width="1227" height="566" alt="image" src="https://github.com/user-attachments/assets/c5f534b6-a41b-49d2-b936-1a9b752347ee" />
+## 📦 Hardware
 
+| Component | Qty |
+|---|:-:|
+| [M5Stack CoreS3 SE](https://shop.m5stack.com/) IoT Controller (without Battery Bottom) | 1 |
+| [AtomS3U](https://shop.m5stack.com/) ESP32S3 Dev Kit with USB-A | 2 |
+| M5GO Battery Bottom3 (for CoreS3 only) | 1 |
+| M5GO / FIRE Battery Bottom Charging Base | 1 |
+| M5Stack USB Module V1.2 — for M5Core *(legacy BT only)* | 1 |
+| Bluetooth 4.0 USB Module *(legacy BT only)* | 1 |
+| M3×25 DIN 912 A2 screws | 2 |
+| M3×22 DIN 912 A2 screws | 2 |
 
-- Open Arduino IDE and go to Tools -> Ports, check if /dev/cu.usbmodem... location exists (if yes - driver is working, if no - you did not install driver from step 2)
-<img width="805" height="362" alt="image" src="https://github.com/user-attachments/assets/e313367a-efe7-4d20-92ee-d5eebb17751c" />
+### Tested Peripherals
 
+| Device | Role |
+|---|---|
+| Apple Magic Keyboard (wireless, USB-C, 2021) | Bluetooth keyboard |
+| Keychron M3 Mini (wireless USB-C dongle) | 1000 Hz wireless mouse |
 
-- In Arduino go to settings -> Additional boards manager URLs -> paste this url there: https://m5stack.oss-cn-shenzhen.aliyuncs.com/resource/arduino/package_m5stack_index.json
-<img width="886" height="531" alt="image" src="https://github.com/user-attachments/assets/2bed3b3b-b131-4c99-9587-f28b29754c4f" />
+---
 
+## 🛠️ Setup Guide
 
-- Click Tools -> Board -> Boards Manager, input "M5Stack" and install "M5Stack by M5Stack", also install esp32 by Espressif System 
-<img width="347" height="420" alt="image" src="https://github.com/user-attachments/assets/64eaae41-0942-4eb1-9433-b4c6b0c3464f" />
-<img width="416" height="212" alt="image" src="https://github.com/user-attachments/assets/f2fe4450-c7dd-468c-9c8c-9e0df3674858" />
+> This guide uses **macOS**. For other operating systems, download the equivalent files for your platform.
 
+### 1 — Install Arduino IDE
 
+Download from [arduino.cc/en/software](https://www.arduino.cc/en/software).
 
-- Click Tools -> Board -> M5Stack, select M5AtomS3
-<img width="972" height="912" alt="image" src="https://github.com/user-attachments/assets/4be5d35f-2a74-4b5a-885a-4ad44b395c0a" />
+### 2 — Install USB Driver
 
+Plug the first **Atom S3U** into your Mac, then install the USB driver from  
+👉 [docs.m5stack.com/en/download](https://docs.m5stack.com/en/download)
 
-- Click Tools -> Manage Libraries, input "M5Unified" and "NimBLE-Arduino" and install them
-<img width="828" height="788" alt="image" src="https://github.com/user-attachments/assets/e6a6d9ba-8ea7-4ac3-9e12-511c020b295e" />
+I used the `.pkg` installer — no reboot needed, just follow the prompts.
 
+<img width="1227" alt="USB driver download page" src="https://github.com/user-attachments/assets/c5f534b6-a41b-49d2-b936-1a9b752347ee" />
 
-- Go to sketch menu and paste this into it:
+### 3 — Verify the Port
+
+Open Arduino IDE → **Tools → Ports**.  
+Confirm `/dev/cu.usbmodem…` appears (if not — driver isn't installed).
+
+<img width="805" alt="Arduino port selection" src="https://github.com/user-attachments/assets/e313367a-efe7-4d20-92ee-d5eebb17751c" />
+
+### 4 — Add M5Stack Board URL
+
+Go to **Settings → Additional boards manager URLs** and paste:
+
+```
+https://m5stack.oss-cn-shenzhen.aliyuncs.com/resource/arduino/package_m5stack_index.json
+```
+
+<img width="886" alt="Board manager URL" src="https://github.com/user-attachments/assets/2bed3b3b-b131-4c99-9587-f28b29754c4f" />
+
+### 5 — Install Board Packages
+
+**Tools → Board → Boards Manager** — search and install:
+
+- **M5Stack** by M5Stack  
+- **esp32** by Espressif Systems
+
+<img width="347" alt="M5Stack board package" src="https://github.com/user-attachments/assets/64eaae41-0942-4eb1-9433-b4c6b0c3464f" />
+<img width="416" alt="ESP32 board package" src="https://github.com/user-attachments/assets/f2fe4450-c7dd-468c-9c8c-9e0df3674858" />
+
+### 6 — Select Board
+
+**Tools → Board → M5Stack → M5AtomS3**
+
+<img width="972" alt="Board selection" src="https://github.com/user-attachments/assets/4be5d35f-2a74-4b5a-885a-4ad44b395c0a" />
+
+### 7 — Install Libraries
+
+**Tools → Manage Libraries** — install:
+
+- `M5Unified`  
+- `NimBLE-Arduino`
+
+<img width="828" alt="Library manager" src="https://github.com/user-attachments/assets/e6a6d9ba-8ea7-4ac3-9e12-511c020b295e" />
+
+---
+
+## 🔍 Step 1 — Get MAC Addresses of Both Atom S3U
+
+Paste this sketch and upload it to the **first** Atom S3U:
+
 ```ino
 #include <WiFi.h>
 
@@ -66,18 +114,25 @@ void loop() {
 }
 ```
 
-- Go to Sketch, click Upload, wait for it to upload
-<img width="1513" height="1117" alt="image" src="https://github.com/user-attachments/assets/d8a80515-bc94-4b97-935c-26dea4b829ad" />
+Upload via **Sketch → Upload**, then open **Tools → Serial Monitor** and copy the MAC address (e.g. `3C:DC:75:ED:FB:4C`). **Save it.**
 
+<img width="1513" alt="Upload sketch" src="https://github.com/user-attachments/assets/d8a80515-bc94-4b97-935c-26dea4b829ad" />
+<img width="948" alt="Serial monitor MAC address" src="https://github.com/user-attachments/assets/e59a0336-30f1-411f-8348-48dc098f92f5" />
 
-- Click Tools -> Serial Monitor, copy mac address from filed below (For me it's 3C:DC:75:ED:FB:4C), save it somewhere
-<img width="948" height="1110" alt="image" src="https://github.com/user-attachments/assets/e59a0336-30f1-411f-8348-48dc098f92f5" />
+Now **swap to the second Atom S3U** and repeat. Save both MAC addresses.
 
+---
 
-- Now insert the second M5AtomS3 into mac (instead of first one) and repeat same steps starting from "sketch upload", my second mac address is D0:CF:13:0F:90:48, also save it somewhere
+## ⚡ Step 2 — Flash the Atom S3U Receiver Firmware
 
-- Change your sketch to this one and upload it to both "Atom S3U" devices, but this time change the usb mode to USB-OTG(TinyUSB)
-<img width="848" height="169" alt="image" src="https://github.com/user-attachments/assets/f418d42b-d1da-4661-996c-152d55c2fdb7" />
+> ⚠️ **Important:** Before uploading, change **USB Mode** to **USB-OTG (TinyUSB)**.
+
+<img width="848" alt="USB-OTG mode" src="https://github.com/user-attachments/assets/f418d42b-d1da-4661-996c-152d55c2fdb7" />
+
+Upload the following sketch to **both** Atom S3U devices:
+
+<details>
+<summary>📄 <b>Atom S3U Receiver Sketch</b> — click to expand</summary>
 
 ```ino
 #include <Arduino.h>
@@ -250,23 +305,43 @@ void loop() {
 }
 ```
 
-- Most likely you'll see this window and error "Port monitor error: command 'open' failed: no such file or directory. Could not connect to /dev/cu.usbmodem1101 serial port." in Arduino - that's okay, it means everything works properly (If you'll neet to change Sketch in future - Press and hold reset button in AtomS3U, insert it into usb port (you still have to press that button), wait for 1 second, unpress the button, now you'll see port selection again in Arduino) 
-<img width="535" height="193" alt="image" src="https://github.com/user-attachments/assets/78412161-a1da-4c09-9c98-0fd6c2aa9a8c" />
-<img width="977" height="678" alt="image" src="https://github.com/user-attachments/assets/aeb8694a-97b2-4cb4-babc-9a8a97992d04" />
+</details>
 
+After upload you'll likely see this error — **that's expected and means it worked:**
 
-- Now connect CoreS3 SE to your macbook, go to Board -> M5Stack -> M5CoreS3 
-<img width="909" height="1104" alt="image" src="https://github.com/user-attachments/assets/31de6870-00b4-46dc-8fb6-66f62e7f2c45" />
+> *"Port monitor error: command 'open' failed: no such file or directory."*
 
-- Paste this into sketch; You must change these values:
-uint8_t ATOM_MAC_1[] = {0x3C, 0xDC, 0x75, 0xED, 0xFB, 0x4C}; - mac address of first S3U dongle
-uint8_t ATOM_MAC_2[] = {0xD0, 0xCF, 0x13, 0x0F, 0x90, 0x48}; - mac address of second S3U dongle
-#define BLE_KBD_MATCH "Keyboard" - Part of keyboard name from bluetooth settings (do not use ' or other symbols, try simple search). For example i have Kyrylo's Magic Keyboard - I'm using just Keyboard to look for keyboard.
-MOUSE_SEND_HZ     750 - Hz of mouse (1000, 500, 750, etc). Lower this if you experiece lags or set to 1000hz if signal is good in your room
-bool m4 = (m.buttons & 0x08); - this sets switch button to Mouse4 
-#define USE_MAX_MODULE false - set to true if you attached classic usb module
-#define WITH_KEYBOARD true - set to false if you want to use it without keyboard (just mouse)
-#define BLE_PROBE_MIN_RSSI -55 - Set to -80 or higher if keyboard is far away from you (by default falls-back to nerby devices)
+<img width="535" alt="Expected error" src="https://github.com/user-attachments/assets/78412161-a1da-4c09-9c98-0fd6c2aa9a8c" />
+<img width="977" alt="Upload success" src="https://github.com/user-attachments/assets/aeb8694a-97b2-4cb4-babc-9a8a97992d04" />
+
+> 💡 **Need to re-flash later?** Hold the reset button on the Atom S3U → insert into USB (keep holding) → wait 1 second → release. The port will reappear in Arduino.
+
+---
+
+## 🧠 Step 3 — Flash the CoreS3 SE (Main Controller)
+
+Connect the **CoreS3 SE** to your Mac and select **Tools → Board → M5Stack → M5CoreS3**.
+
+<img width="909" alt="CoreS3 board selection" src="https://github.com/user-attachments/assets/31de6870-00b4-46dc-8fb6-66f62e7f2c45" />
+
+### ⚙️ Configuration
+
+Before uploading, **update these values** in the sketch:
+
+| Variable | Description | Example |
+|---|---|---|
+| `ATOM_MAC_1[]` | MAC of first Atom S3U | `{0x3C, 0xDC, 0x75, 0xED, 0xFB, 0x4C}` |
+| `ATOM_MAC_2[]` | MAC of second Atom S3U | `{0xD0, 0xCF, 0x13, 0x0F, 0x90, 0x48}` |
+| `BLE_KBD_MATCH` | Part of your keyboard's BT name (no special chars) | `"Keyboard"` |
+| `MOUSE_SEND_HZ` | Mouse poll rate (lower if laggy) | `750` |
+| `USE_MAX_MODULE` | Set `true` if using the classic USB module | `false` |
+| `WITH_KEYBOARD` | Set `false` for mouse-only mode | `true` |
+| `BLE_PROBE_MIN_RSSI` | Raise to `-80` if keyboard is far away | `-55` |
+
+> 💡 The switch button is bound to **Mouse4** (`m.buttons & 0x08`) by default.
+
+<details>
+<summary>📄 <b>CoreS3 SE Main Controller Sketch</b> — click to expand</summary>
 
 ```ino
 #include <Arduino.h>
@@ -299,7 +374,7 @@ uint8_t ATOM_MAC_2[] = {0xD0, 0xCF, 0x13, 0x0F, 0x90, 0x48};
 #define SEEN_DEV_MAX 48
 #define SEEN_NAME_LEN 40
 #define BLE_PROBE_MAX 8
-#define BLE_PROBE_MIN_RSSI -55
+#define BLE_PROBE_MIN_RSSI -50
 #define SCAN_COL_ROWS 12
 #define TOP_DISPLAY (SCAN_COL_ROWS * 2)
 #define PASSKEY_DISPLAY_MS 30000
@@ -780,6 +855,7 @@ static bool mxEnumerateBt() {
     }
     if (dT == 0x05 && dL >= 7 && (isBtIf || isBtDev)) {
       uint8_t ea = buf[off + 2], et = buf[off + 3] & 0x03;
+      uint16_t mps = buf[off + 4] | (buf[off + 5] << 8);
       if (et == 0x03 && (ea & 0x80) && !mxBtEvtEp) mxBtEvtEp = ea & 0x0F;
     }
     off += dL;
@@ -1877,7 +1953,7 @@ static void drawUI() {
     }
   }
 
-  M5.Display.setCursor(10, 230);
+  M5.Display.setCursor(5, 230);
   M5.Display.setTextSize(1);
   M5.Display.setTextColor(DARKGREY);
   M5.Display.printf("stk:%d idle:%d heap:%d",
@@ -1885,7 +1961,7 @@ static void drawUI() {
     idleLevel(),
     esp_get_free_heap_size() / 1024);
 
-  M5.Display.setCursor(10, 220);
+  M5.Display.setCursor(5, 220);
   M5.Display.setTextSize(1);
   M5.Display.setTextColor(wasReboot ? RED : DARKGREY);
   M5.Display.printf("%s%s", wasReboot ? "!" : "", rtcDbg);
@@ -2014,9 +2090,48 @@ void loop() {
 }
 ```
 
-- Click reset button once (DO NOT HOLD) on M5Stack CoreS3 se and you'll see new screen. Now plug-in mouse dongle and connect keyboard via bluetooth (Pairing starts automatically as soon as you enable the device). Don't forget to click "Forget" in macos settings if you already connected keyboard to macos via bluetooth.
+</details>
 
-Known issues: 
-- Mouse can be laggy during keyboard lookup process (once it finishes, everything goes back to normal) (Device has only 1 radio module so it's impossible to fix)
-- Sometimes keyboard might ask you to input security code on it which will be displayed on device screen
-- Config has inactivity time of 5 minutes (light idle) (15min = deep idle) - if you don't use keyboard/mouse during this time - it goes into semi-sleep mode where it does not read input 1000times per second and starts working more efficiently until you start using devices again (first movement might be delayed because of this)
+---
+
+## 🚀 First Run
+
+1. Press the **reset button once** (don't hold) on the CoreS3 SE
+2. Plug in your **mouse dongle** to the CoreS3 USB port
+3. The device will **auto-scan and pair** your Bluetooth keyboard
+4. Make sure to **"Forget"** the keyboard in macOS Bluetooth settings first if it was previously paired with your Mac
+
+---
+
+## ⚠️ Known Issues
+
+| Issue | Explanation |
+|---|---|
+| **Mouse lag during BT scan** | The device has a single radio module shared between ESP-NOW (mouse) and BLE (keyboard). Lag stops once keyboard pairing completes. |
+| **Security PIN prompt** | Some keyboards require entering a 6-digit PIN displayed on the CoreS3 screen. |
+| **First input delay after idle** | The device enters power-saving mode after inactivity (5 min = light idle, 15 min = deep idle). The first mouse movement after wake may feel slightly delayed. |
+
+---
+
+## 🏗️ Architecture
+
+```
+┌──────────────┐      ESP-NOW       ┌──────────────┐
+│  Wireless    │  ───────────────►  │  AtomS3U #1  │──── USB ──── PC 1
+│  Mouse       │                    └──────────────┘
+│  (dongle) ──►│ CoreS3 SE          ┌──────────────┐
+│              │  ───────────────►  │  AtomS3U #2  │──── USB ──── PC 2
+│  Bluetooth   │      ESP-NOW       └──────────────┘
+│  Keyboard ──►│
+└──────────────┘
+        │
+   [Mouse4] = Switch PC
+```
+
+The CoreS3 SE acts as the central hub: it reads the USB mouse dongle and BLE keyboard, then forwards all HID events over ESP-NOW to whichever Atom S3U is currently active. Each Atom S3U appears as a standard USB keyboard + mouse to its host PC.
+
+---
+
+## 📜 License
+
+MIT
