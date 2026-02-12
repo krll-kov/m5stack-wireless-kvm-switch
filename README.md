@@ -2054,6 +2054,43 @@ struct scan_disp_entry_t {
   uint8_t flags;
 };
 
+#define BAT_SAMPLES 8
+#define BAT_SAMPLE_MS 30000 
+
+static float batVSamples[BAT_SAMPLES] = {0};
+static int   batPctSamples[BAT_SAMPLES] = {0};
+static int   batIdx = 0, batCnt = 0;
+static uint32_t batCheckLast = 0;
+static bool extPowerDetected = false;
+static void updateBatTrend() {
+    if (millis() - batCheckLast < BAT_SAMPLE_MS) return;
+    batCheckLast = millis();
+
+    float v = M5.Power.getBatteryVoltage();
+    int pct = M5.Power.getBatteryLevel();
+
+    batVSamples[batIdx % BAT_SAMPLES] = v;
+    batPctSamples[batIdx % BAT_SAMPLES] = pct;
+    batIdx++;
+    if (batCnt < BAT_SAMPLES) batCnt++;
+
+    bool was = extPowerDetected;
+
+    if (batCnt >= 4) {
+        int   oldPct = batPctSamples[(batIdx - batCnt) % BAT_SAMPLES];
+        float oldV   = batVSamples[(batIdx - batCnt) % BAT_SAMPLES];
+
+        if (pct > oldPct)            extPowerDetected = true;
+        else if (v > oldV + 3.0f)    extPowerDetected = true;
+        else if (pct < oldPct - 1)   extPowerDetected = false;
+        else if (v < oldV - 15.0f)   extPowerDetected = false;
+        // hysteresis
+    }
+
+    if (extPowerDetected != was) needRedraw = true;
+    if (batCnt < 4) needRedraw = true;
+}
+
 static void drawUI() {
   if (screenTurnedOff) return;
 
@@ -2134,6 +2171,7 @@ static void drawUI() {
   }
 
   int y = yBase + 2;
+  int yLimit = 194;
 
   if (cBS == 1) {
     scan_disp_entry_t dd[TOP_DISPLAY];
@@ -2166,7 +2204,7 @@ static void drawUI() {
     for (int t = 0; t < ddN; t++) {
       int col = t / SCAN_COL_ROWS, row = t % SCAN_COL_ROWS;
       int xP = col == 0 ? 10 : 168, yP = y + row * 11;
-      if (yP > 228) break;
+      if (yP > yLimit) break;
       M5.Display.setCursor(xP, yP);
       if (dd[t].flags & 0x01)
         M5.Display.setTextColor(WHITE);
@@ -2192,7 +2230,7 @@ static void drawUI() {
     M5.Display.setTextColor(CYAN);
     M5.Display.printf("Probing %d of %d devices", cPT, cSC);
     y += 14;
-    for (int i = 0; i < cPLC && y < 230; i++) {
+    for (int i = 0; i < cPLC && y < yLimit; i++) {
       M5.Display.setCursor(10, y);
       if (strstr(probeLog[i], "HID!"))
         M5.Display.setTextColor(GREEN);
@@ -2217,7 +2255,7 @@ static void drawUI() {
       M5.Display.setTextColor(DARKGREY);
       M5.Display.print("Last results:");
       y += 12;
-      for (int i = 0; i < cPLC && y < 230; i++) {
+      for (int i = 0; i < cPLC && y < yLimit; i++) {
         M5.Display.setCursor(10, y);
         M5.Display.setTextColor(DARKGREY);
         M5.Display.print(probeLog[i]);
@@ -2226,32 +2264,33 @@ static void drawUI() {
     }
   }
 
-  // Footer line 1: debug or standard
   M5.Display.setTextSize(1);
 #if DEBUG_MODE
   float cpuTemp = 0;
   if (temp_handle) temperature_sensor_get_celsius(temp_handle, &cpuTemp);
 
-  M5.Display.setCursor(5, 210);
+  M5.Display.setCursor(5, 196);
   M5.Display.setTextColor(cpuTemp > 60 ? RED : CYAN);
   // T:Temp | U:InputHz | E:OutputHz | Q:Queue
   M5.Display.printf("T:%.0fC U:%d E:%d Q:%d", cpuTemp, (int)dbgUsbHz,
                     (int)dbgEspHz, dbgQPeak);
 #endif
-  M5.Display.setCursor(5, 220);
-  M5.Display.setTextColor(wasReboot ? RED : DARKGREY);
-  M5.Display.printf("%s%s", wasReboot ? "!" : "", rtcDbg);
+  float batV = M5.Power.getBatteryVoltage() / 1000.0f;
+  int batPct = M5.Power.getBatteryLevel();
 
-  int bat = M5.Power.getBatteryLevel();
+  M5.Display.setCursor(5, 226);
+  M5.Display.setTextSize(1);
 
-  M5.Display.setCursor(5, 230);
-
-  M5.Display.setTextColor(bat < 20 ? RED : GREEN);
-  M5.Display.printf("Bat:%d%%  ", bat);
-
-  M5.Display.setTextColor(DARKGREY);
-  M5.Display.printf("S:%d H:%d", uxTaskGetStackHighWaterMark(NULL),
-                    esp_get_free_heap_size() / 1024);
+  if (extPowerDetected) {
+      M5.Display.setTextColor(GREEN);
+      M5.Display.printf("PWR: POGO CHARGING (%d%% %.2fV)", batPct, batV);
+  } else if (batCnt < BAT_SAMPLES) {
+      M5.Display.setTextColor(YELLOW);
+      M5.Display.printf("PWR: detecting... (%d%% %.2fV)", batPct, batV);
+  } else {
+      M5.Display.setTextColor(RED);
+      M5.Display.printf("PWR: BATTERY (%d%% %.2fV)", batPct, batV);
+  }
 
   M5.Display.endWrite();
 }
@@ -2263,6 +2302,7 @@ void setup() {
   M5.Speaker.end();
   M5.Power.begin();
   M5.Power.setUsbOutput(true);
+
   Serial.begin(115200);
   delay(100);
   M5.Display.setBrightness(60);
@@ -2417,6 +2457,7 @@ void loop() {
       }
   }
 
+  updateBatTrend();
   bool force = false;
   if (cP) {
     static uint32_t lp = 0;
@@ -2460,7 +2501,7 @@ void loop() {
 | **Security PIN prompt** | Some keyboards require entering a 6-digit PIN displayed on the CoreS3 screen. |
 | **First input delay after idle** | The device enters power-saving mode after inactivity (10 sec = 1ms delay, 1 minute = 20ms delay, 5 min = 50ms delay, 15 min = 100ms delay). The first mouse movement after wake may feel slightly delayed. |
 | **Mouse rate is not 1000Hz** | Read speed of your mouse is pure 1:1 from your mouse settings (as long as device is capable of this rate. I did not test it with mouse that has higher than 1000Hz, but it does support 1000Hz input!). But output works differently, you have to update MOUSE_SEND_HZ variable and set it a value that is higher than actual mouse rate, for example for my keychrone m3 mini i get 1000Hz ouput rate when i set MOUSE_SEND_HZ to 1750-2000 (this number is more like code delay between iterations) |
-| **Battery status does not update** | If you don't use debug mode, the only way to update the screen is to press mouse4 to switch pc or to plug-out/in mouse dongle, this is made for performance reasons |
+| **Battery status does not update** | If you don't use debug mode, the only way to update the screen is to press mouse4 to switch pc or to plug-out/in mouse dongle, this is made for performance reasons. Also if you charge with battery base - we can't get the voltage and other info directly with code so we measure it by taking periodic battery samples |
 | **Screen goes black** | This is done because of power efficiency - screen is only displayed during setup/pc switch (10sec here), without it battery will drain faster than it's charing from battery bottom |
 
 ---
