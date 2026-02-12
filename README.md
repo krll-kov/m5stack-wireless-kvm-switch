@@ -170,8 +170,10 @@ void tud_connect(void);
 static uint32_t usbGoneSinceMs = 0;
 #define USB_GONE_REPLUG_MS 30000
 
-#define USB_IDLE_TIMEOUT_MS 60000
-#define USB_IDLE_DELAY_MS   250
+#define USB_IDLE_TIMEOUT_MS_2 60000
+#define USB_IDLE_DELAY_MS_2   250
+#define USB_IDLE_TIMEOUT_MS_1 10000
+#define USB_IDLE_DELAY_MS_1  50
 
 USBHIDKeyboard UsbKbd;
 USBHIDMouse UsbMouse;
@@ -326,8 +328,11 @@ void usbTask(void *pvParameters) {
       xQueueReset(mouseQ);
       xQueueReset(kbdQ);
     } else {
-      if (millis() - lastInputMs > USB_IDLE_TIMEOUT_MS) {
-          vTaskDelay(pdMS_TO_TICKS(USB_IDLE_DELAY_MS));
+      uint32_t millisNow = millis() - lastInputMs;
+      if (millisNow > USB_IDLE_TIMEOUT_MS_2) {
+          vTaskDelay(pdMS_TO_TICKS(USB_IDLE_DELAY_MS_2));
+      } else if (millisNow > USB_IDLE_TIMEOUT_MS_1) {
+          vTaskDelay(pdMS_TO_TICKS(USB_IDLE_DELAY_MS_1));  
       } else {
         taskYIELD();
       }
