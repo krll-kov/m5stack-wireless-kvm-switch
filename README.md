@@ -144,6 +144,13 @@ Upload the following sketch to **both** Atom S3U devices:
 #include "USBHIDMouse.h"
 #include "freertos/queue.h"
 
+// ── TinyUSB health-check functions (always linked when USB-OTG mode) ──
+extern "C" {
+  bool tud_mounted(void);
+  bool tud_suspended(void);
+  bool tud_remote_wakeup(void);
+}
+
 #define ESPNOW_CHAN 1
 
 #define PKT_MOUSE      0x01
@@ -152,43 +159,41 @@ Upload the following sketch to **both** Atom S3U devices:
 #define PKT_DEACTIVATE 0x04
 #define PKT_HEARTBEAT  0x05
 
+// ── Watchdog thresholds ──
+#define BOOT_GRACE_MS       5000   // USB enumeration grace period after boot
+#define ESPNOW_TIMEOUT_MS  1500   // no packets from CoreS3 → restart
+#define USB_STUCK_MS        4000   // USB unhealthy while active → restart
+#define USB_WAKEUP_EVERY   2000   // remote-wakeup attempt interval
+
 USBHIDKeyboard UsbKbd;
 USBHIDMouse    UsbMouse;
 
 #pragma pack(push, 1)
-struct MousePkt {
-  uint8_t btn;
-  int16_t dx;
-  int16_t dy;
-  int8_t  whl;
-};
-
-struct KbdPkt {
-  uint8_t mod;
-  uint8_t keys[6];
-};
+struct MousePkt { uint8_t btn; int16_t dx, dy; int8_t whl; };
+struct KbdPkt   { uint8_t mod; uint8_t keys[6]; };
 #pragma pack(pop)
 
 QueueHandle_t mouseQ;
 QueueHandle_t kbdQ;
 
-volatile bool deviceActive   = false;
+volatile bool deviceActive      = false;
 volatile bool pendingActivate   = false;
 volatile bool pendingDeactivate = false;
 static uint8_t prevBtn = 0;
 
+// ── Health state ──
+static uint32_t bootMs         = 0;
+volatile uint32_t lastPacketMs = 0;
+static uint32_t usbBadSinceMs = 0;
+static uint32_t lastWakeupMs  = 0;
+
 void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (len < 1) return;
+  lastPacketMs = millis();
 
   switch (data[0]) {
-    case PKT_ACTIVATE:
-      pendingActivate = true;
-      break;
-
-    case PKT_DEACTIVATE:
-      pendingDeactivate = true;
-      break;
-
+    case PKT_ACTIVATE:   pendingActivate   = true; break;
+    case PKT_DEACTIVATE: pendingDeactivate = true; break;
     case PKT_MOUSE:
       if (len >= 7) {
         MousePkt p;
@@ -199,7 +204,6 @@ void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
         xQueueSend(mouseQ, &p, 0);
       }
       break;
-
     case PKT_KEYBOARD:
       if (len >= 8) {
         KbdPkt k;
@@ -208,46 +212,77 @@ void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
         xQueueSend(kbdQ, &k, 0);
       }
       break;
-
-    case PKT_HEARTBEAT:
-      break;
+    case PKT_HEARTBEAT: break;
   }
 }
 
 void setup() {
+  bootMs = millis();
+
   UsbMouse.begin();
   UsbKbd.begin();
   USB.begin();
 
   mouseQ = xQueueCreate(128, sizeof(MousePkt));
-  kbdQ   = xQueueCreate(32, sizeof(KbdPkt));
+  kbdQ   = xQueueCreate(32,  sizeof(KbdPkt));
 
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   esp_wifi_set_channel(ESPNOW_CHAN, WIFI_SECOND_CHAN_NONE);
-
-  if (esp_now_init() == ESP_OK) {
+  if (esp_now_init() == ESP_OK)
     esp_now_register_recv_cb(onRecv);
-  }
+
+  lastPacketMs = millis();
 }
 
 void loop() {
-  // handle state changes HERE, same thread as USB operations
+  uint32_t now = millis();
+  bool grace = (now - bootMs) < BOOT_GRACE_MS;
+
+  // ══════════════════════════════════════════════
+  //  WATCHDOG 1 — ESP-NOW packet timeout
+  //  CoreS3 sends ACTIVATE/DEACTIVATE every 500ms.
+  //  If nothing arrives for 30s, radio link is dead.
+  // ══════════════════════════════════════════════
+  if (!grace && (now - lastPacketMs > ESPNOW_TIMEOUT_MS))
+    ESP.restart();
+
+  // ══════════════════════════════════════════════
+  //  WATCHDOG 2 — USB health
+  //  If TinyUSB reports not-mounted or suspended
+  //  while we're the active target → USB is stuck.
+  // ══════════════════════════════════════════════
+  if (!grace && deviceActive) {
+    bool mounted   = tud_mounted();
+    bool suspended = tud_suspended();
+    bool usbOk     = mounted;
+
+    if (!usbOk) {
+      if (usbBadSinceMs == 0) usbBadSinceMs = now;
+      else if (now - usbBadSinceMs > USB_STUCK_MS)
+        ESP.restart();
+    } else {
+      usbBadSinceMs = 0;
+    }
+  } else {
+    usbBadSinceMs = 0;
+  }
+
+  // ══════════════════════════════════════════════
+  //  Activate / Deactivate (unchanged logic)
+  // ══════════════════════════════════════════════
   if (pendingDeactivate) {
     pendingDeactivate = false;
-    if (deviceActive) {  
+    if (deviceActive) {
       deviceActive = false;
       UsbKbd.releaseAll();
       UsbMouse.release(MOUSE_LEFT | MOUSE_RIGHT | MOUSE_MIDDLE);
       prevBtn = 0;
-
-      MousePkt dm;
-      KbdPkt   dk;
+      MousePkt dm; KbdPkt dk;
       while (xQueueReceive(mouseQ, &dm, 0) == pdTRUE) {}
       while (xQueueReceive(kbdQ,   &dk, 0) == pdTRUE) {}
     }
   }
-
   if (pendingActivate) {
     pendingActivate = false;
     if (!deviceActive) {
@@ -258,7 +293,9 @@ void loop() {
     }
   }
 
-  // process mouse
+  // ══════════════════════════════════════════════
+  //  Mouse processing
+  // ══════════════════════════════════════════════
   MousePkt p;
   while (deviceActive && xQueueReceive(mouseQ, &p, 0) == pdTRUE) {
     if (p.btn != prevBtn) {
@@ -268,22 +305,19 @@ void loop() {
       if (chg & 0x04) { (p.btn & 0x04) ? UsbMouse.press(MOUSE_MIDDLE) : UsbMouse.release(MOUSE_MIDDLE); }
       prevBtn = p.btn;
     }
-
-    int16_t rx = p.dx;
-    int16_t ry = p.dy;
+    int16_t rx = p.dx, ry = p.dy;
     int8_t  rw = p.whl;
-
-    while (rx != 0 || ry != 0 || rw != 0) {
+    while (rx || ry || rw) {
       int8_t sx = (int8_t)constrain(rx, -127, 127);
       int8_t sy = (int8_t)constrain(ry, -127, 127);
       UsbMouse.move(sx, sy, rw);
-      rx -= sx;
-      ry -= sy;
-      rw  = 0;
+      rx -= sx; ry -= sy; rw = 0;
     }
   }
 
-  // process keyboard
+  // ══════════════════════════════════════════════
+  //  Keyboard processing
+  // ══════════════════════════════════════════════
   KbdPkt k;
   while (deviceActive && xQueueReceive(kbdQ, &k, 0) == pdTRUE) {
     KeyReport rpt;
@@ -295,8 +329,7 @@ void loop() {
 
   // drain when inactive
   if (!deviceActive) {
-    MousePkt dm;
-    KbdPkt   dk;
+    MousePkt dm; KbdPkt dk;
     while (xQueueReceive(mouseQ, &dm, 0) == pdTRUE) {}
     while (xQueueReceive(kbdQ,   &dk, 0) == pdTRUE) {}
   }
