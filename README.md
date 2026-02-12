@@ -83,7 +83,8 @@ https://m5stack.oss-cn-shenzhen.aliyuncs.com/resource/arduino/package_m5stack_in
 **Tools → Manage Libraries** — install:
 
 - `M5Unified`  
-- `NimBLE-Arduino`
+- `NimBLE-Arduino` (by h2zero)
+- `FastLED` (by Daniel Garcia)
 
 <img width="828" alt="Library manager" src="https://github.com/user-attachments/assets/e6a6d9ba-8ea7-4ac3-9e12-511c020b295e" />
 
@@ -466,6 +467,7 @@ Before uploading, **update these values** in the sketch:
 #include <Arduino.h>
 #include <M5Unified.h>
 #include <NimBLEDevice.h>
+#include <FastLED.h>
 #include <SPI.h>
 #include <WiFi.h>
 #include <esp_now.h>
@@ -598,8 +600,10 @@ static bool wasReboot = false;
 temperature_sensor_handle_t temp_handle = NULL;
 
 static volatile uint32_t lastActivityMs = 0;
+static volatile uint32_t lastPCSwitchMs = 0;
 static volatile int lastIdleLevel = 0;
 static volatile bool screenTurnedOff = false;
+static volatile bool wifiNeedsBackToNormal = false;
 
 #define IDLE1_TIMEOUT_MS 10000
 #define IDLE2_TIMEOUT_MS 60000
@@ -2051,7 +2055,7 @@ struct scan_disp_entry_t {
 };
 
 static void drawUI() {
-  if(lastIdleLevel >= 3) return;
+  if (screenTurnedOff) return;
 
   if (passkeyActive) {
     drawPasskey();
@@ -2256,15 +2260,22 @@ static void drawUI() {
 void setup() {
   auto cfg = M5.config();
   M5.begin(cfg);
+  M5.Speaker.end();
   M5.Power.begin();
   M5.Power.setUsbOutput(true);
   Serial.begin(115200);
   delay(100);
+  M5.Display.setBrightness(60);
   M5.Display.setRotation(1);
   M5.Display.fillScreen(BLACK);
   M5.Display.setTextSize(2);
   M5.Display.setCursor(10, 10);
   M5.Display.println("KVM Init...");
+
+  CRGB leds[10];
+  FastLED.addLeds<WS2812, 5, GRB>(leds, 10);
+  fill_solid(leds, 10, CRGB::Black);
+  FastLED.show();
 
   if (rtcDbg[0] >= 0x20 && rtcDbg[0] < 0x7F) {
     wasReboot = true;
@@ -2343,6 +2354,7 @@ void loop() {
   if ((M5.BtnA.wasPressed() || switchRequest) &&
       millis() - lastSwitchMs > SWITCH_DEBOUNCE_MS) {
     lastActivityMs = millis();
+    lastPCSwitchMs = lastActivityMs;
     switchRequest = false;
     switchTarget();
   }
@@ -2368,22 +2380,43 @@ void loop() {
     lastBeat = millis();
   }
 
-if (idlelvl != lastIdleLevel) {
-    lastIdleLevel = idlelvl;
-    if (idlelvl < 3) {
+  bool cU = usbMouseReady, cB = bleKbdConnected, cP = passkeyActive;
+  int cS = bleState;
+  bool screenNeeded = false;
+
+  // BLE setup phases: scanning, found, connecting, connected-first-time, probing
+  if (cS >= 1 && cS <= 6) screenNeeded = true;
+
+  // Passkey active
+  if (cP) screenNeeded = true;
+
+  // 10s after PC switch
+  if (millis() - lastPCSwitchMs < 10000) screenNeeded = true;
+
+  if (screenNeeded && screenTurnedOff) {
       M5.Display.wakeup();
-      M5.Display.setBrightness(128);
+      M5.Display.setBrightness(60);
       screenTurnedOff = false;
-    } else if (!screenTurnedOff) {
+      needRedraw = true;
+  } else if (!screenNeeded && !screenTurnedOff) {
       M5.Display.setBrightness(0);
       M5.Display.sleep();
       screenTurnedOff = true;
-    }
-    needRedraw = true;
-}
+  }
 
-  bool cU = usbMouseReady, cB = bleKbdConnected, cP = passkeyActive;
-  int cS = bleState;
+  if (idlelvl != lastIdleLevel) {
+      lastIdleLevel = idlelvl;
+      if (idlelvl >= 3) {
+        wifiNeedsBackToNormal = true;
+        esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
+        esp_wifi_set_max_tx_power(40);
+      } else if (wifiNeedsBackToNormal) {
+        esp_wifi_set_ps(WIFI_PS_NONE);
+        esp_wifi_set_max_tx_power(80); 
+        wifiNeedsBackToNormal = false;
+      }
+  }
+
   bool force = false;
   if (cP) {
     static uint32_t lp = 0;
