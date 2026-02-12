@@ -2281,15 +2281,29 @@ static void drawUI() {
   M5.Display.setCursor(5, 226);
   M5.Display.setTextSize(1);
 
-  if (extPowerDetected) {
+  if (extPowerDetected && batCnt >= 4) {
+      float oldV = batVSamples[(batIdx - batCnt) % BAT_SAMPLES];
+      int oldPct = batPctSamples[(batIdx - batCnt) % BAT_SAMPLES];
+      float windowMin = (batCnt - 1) * BAT_SAMPLE_MS / 60000.0f;
+      float mvPerMin = (windowMin > 0.1f) ? (batV * 1000.0f - oldV) / windowMin : 0;
+      float pctPerHr = (windowMin > 0.1f) ? (batPct - oldPct) * 60.0f / windowMin : 0;
+
       M5.Display.setTextColor(GREEN);
-      M5.Display.printf("PWR: POGO CHARGING (%d%% %.2fV)", batPct, batV);
-  } else if (batCnt < BAT_SAMPLES) {
+      if (pctPerHr > 0.3f) {
+          int etaMin = (int)((100 - batPct) * 60.0f / pctPerHr);
+          M5.Display.printf("CHG %d%% %.2fV +%.0f%%/h ~%dh%02dm",
+                            batPct, batV, pctPerHr, etaMin / 60, etaMin % 60);
+      } else {
+          M5.Display.printf("CHG %d%% %.2fV +%.1fmV/m",
+                            batPct, batV, mvPerMin);
+      }
+  } else if (batCnt < 4) {
       M5.Display.setTextColor(YELLOW);
-      M5.Display.printf("PWR: detecting... (%d%% %.2fV)", batPct, batV);
+      int secLeft = (4 - batCnt) * BAT_SAMPLE_MS / 1000;
+      M5.Display.printf("PWR: detecting (90s) %ds... (%d%%)", secLeft, batPct);
   } else {
       M5.Display.setTextColor(RED);
-      M5.Display.printf("PWR: BATTERY (%d%% %.2fV)", batPct, batV);
+      M5.Display.printf("BAT %d%% %.2fV", batPct, batV);
   }
 
   M5.Display.endWrite();
@@ -2375,6 +2389,8 @@ void setup() {
 #if DEBUG_MODE
   dbgLastTick = millis();
 #endif
+
+  batCheckLast = millis() - BAT_SAMPLE_MS;
   drawUI();
 }
 
