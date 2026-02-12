@@ -125,7 +125,7 @@ Now **swap to the second Atom S3U** and repeat. Save both MAC addresses.
 
 ## ⚡ Step 2 — Flash the Atom S3U Receiver Firmware
 
-> ⚠️ **Important:** Before uploading, change **USB Mode** to **USB-OTG (TinyUSB)**.
+> ⚠️ **Important:** Before uploading, change **USB Mode** AND **USB UPLOAD MODE** to **USB-OTG (TinyUSB)**. (BOTH!)
 
 <img width="848" alt="USB-OTG mode" src="https://github.com/user-attachments/assets/f418d42b-d1da-4661-996c-152d55c2fdb7" />
 
