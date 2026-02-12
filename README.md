@@ -172,7 +172,7 @@ static uint32_t usbGoneSinceMs = 0;
 #define USB_IDLE_TIMEOUT_MS_2 60000
 #define USB_IDLE_DELAY_MS_2   250
 #define USB_IDLE_TIMEOUT_MS_1 10000
-#define USB_IDLE_DELAY_MS_1  50
+#define USB_IDLE_DELAY_MS_1  1
 
 USBHIDKeyboard UsbKbd;
 USBHIDMouse UsbMouse;
@@ -601,22 +601,34 @@ static volatile uint32_t lastActivityMs = 0;
 static volatile int lastIdleLevel = 0;
 static volatile bool screenTurnedOff = false;
 
-#define IDLE1_TIMEOUT_MS 300000
-#define IDLE2_TIMEOUT_MS 900000
+#define IDLE1_TIMEOUT_MS 10000
+#define IDLE2_TIMEOUT_MS 60000
+#define IDLE3_TIMEOUT_MS 300000
+#define IDLE4_TIMEOUT_MS 900000
 
-#define IDLE1_MOUSE_SEND_HZ 30
-#define IDLE2_MOUSE_SEND_HZ 2
+#define IDLE1_MOUSE_SEND_HZ (MOUSE_SEND_HZ / 2)
+#define IDLE2_MOUSE_SEND_HZ 100
+#define IDLE3_MOUSE_SEND_HZ 30
+#define IDLE4_MOUSE_SEND_HZ 2
 #define IDLE1_MOUSE_SEND_US (1000000 / IDLE1_MOUSE_SEND_HZ)
 #define IDLE2_MOUSE_SEND_US (1000000 / IDLE2_MOUSE_SEND_HZ)
+#define IDLE3_MOUSE_SEND_US (1000000 / IDLE3_MOUSE_SEND_HZ)
+#define IDLE4_MOUSE_SEND_US (1000000 / IDLE4_MOUSE_SEND_HZ)
 
-#define IDLE1_HEARTBEAT_MS 750
-#define IDLE2_HEARTBEAT_MS 1000
+#define IDLE1_HEARTBEAT_MS 500
+#define IDLE2_HEARTBEAT_MS 600
+#define IDLE3_HEARTBEAT_MS 750
+#define IDLE4_HEARTBEAT_MS 1000
 
-#define IDLE1_LOOP_MS 20
-#define IDLE2_LOOP_MS 100
+#define IDLE1_LOOP_MS 1
+#define IDLE2_LOOP_MS 20
+#define IDLE3_LOOP_MS 50
+#define IDLE4_LOOP_MS 100
 
 static int idleLevel() {
   uint32_t dt = millis() - lastActivityMs;
+  if (dt > IDLE4_TIMEOUT_MS) return 4;
+  if (dt > IDLE3_TIMEOUT_MS) return 3;
   if (dt > IDLE2_TIMEOUT_MS) return 2;
   if (dt > IDLE1_TIMEOUT_MS) return 1;
   return 0;
@@ -1412,9 +1424,13 @@ void mouseSendTask(void *) {
       vTaskDelay(pdMS_TO_TICKS(2));
       continue;
     }
-    TickType_t waitTicks = (idleLevel() == 0)
-                               ? portMAX_DELAY
-                               : pdMS_TO_TICKS((idleLevel() >= 2) ? 50 : 5);
+
+    TickType_t waitTicks;
+    int il = idleLevel();
+    if (il == 0) waitTicks = portMAX_DELAY;
+    else if (il <= 2) waitTicks = pdMS_TO_TICKS(5);
+    else waitTicks = pdMS_TO_TICKS(50);
+    
     bool got = xQueueReceive(mouseQueue, &m, waitTicks) == pdTRUE;
 
     // Batch-drain: if we got one, grab all pending without blocking
@@ -1447,15 +1463,11 @@ void mouseSendTask(void *) {
 
     uint32_t sendInterval;
     switch (idleLevel()) {
-      case 2:
-        sendInterval = IDLE2_MOUSE_SEND_US;
-        break;
-      case 1:
-        sendInterval = IDLE1_MOUSE_SEND_US;
-        break;
-      default:
-        sendInterval = MOUSE_SEND_US;
-        break;
+      case 4: sendInterval = IDLE4_MOUSE_SEND_US; break;
+      case 3: sendInterval = IDLE3_MOUSE_SEND_US; break;
+      case 2: sendInterval = IDLE2_MOUSE_SEND_US; break;
+      case 1: sendInterval = IDLE1_MOUSE_SEND_US; break;
+      default: sendInterval = MOUSE_SEND_US; break;
     }
     if (dirty && micros() - lastUs >= sendInterval) {
       txMouse(&acc);
@@ -2039,7 +2051,7 @@ struct scan_disp_entry_t {
 };
 
 static void drawUI() {
-  if(lastIdleLevel != 0) return;
+  if(lastIdleLevel >= 3) return;
 
   if (passkeyActive) {
     drawPasskey();
@@ -2343,18 +2355,11 @@ void loop() {
 
   int idlelvl = idleLevel();
   switch (idlelvl) {
-    case 2:
-      hbInterval = IDLE2_HEARTBEAT_MS;
-      loopDelay = IDLE2_LOOP_MS;
-      break;
-    case 1:
-      hbInterval = IDLE1_HEARTBEAT_MS;
-      loopDelay = IDLE1_LOOP_MS;
-      break;
-    default:
-      hbInterval = HEARTBEAT_MS;
-      loopDelay = 1;
-      break;
+    case 4: hbInterval = IDLE4_HEARTBEAT_MS; loopDelay = IDLE4_LOOP_MS; break;
+    case 3: hbInterval = IDLE3_HEARTBEAT_MS; loopDelay = IDLE3_LOOP_MS; break;
+    case 2: hbInterval = IDLE2_HEARTBEAT_MS; loopDelay = IDLE2_LOOP_MS; break;
+    case 1: hbInterval = IDLE1_HEARTBEAT_MS; loopDelay = IDLE1_LOOP_MS; break;
+    default: hbInterval = HEARTBEAT_MS; loopDelay = 1; break;
   }
 
   if (millis() - lastBeat > hbInterval) {
@@ -2365,14 +2370,14 @@ void loop() {
 
 if (idlelvl != lastIdleLevel) {
     lastIdleLevel = idlelvl;
-    if (idlelvl == 0) {
-        M5.Display.wakeup();
-        M5.Display.setBrightness(128);
-        screenTurnedOff = false;
-    } else {
-        M5.Display.setBrightness(0);
-        M5.Display.sleep();
-        screenTurnedOff = true;
+    if (idlelvl < 3) {
+      M5.Display.wakeup();
+      M5.Display.setBrightness(128);
+      screenTurnedOff = false;
+    } else if (!screenTurnedOff) {
+      M5.Display.setBrightness(0);
+      M5.Display.sleep();
+      screenTurnedOff = true;
     }
     needRedraw = true;
 }
@@ -2420,7 +2425,8 @@ if (idlelvl != lastIdleLevel) {
 |---|---|
 | **Mouse lag during BT scan** | The device has a single radio module shared between ESP-NOW (mouse) and BLE (keyboard). Lag stops once keyboard pairing completes. |
 | **Security PIN prompt** | Some keyboards require entering a 6-digit PIN displayed on the CoreS3 screen. |
-| **First input delay after idle** | The device enters power-saving mode after inactivity (5 min = light idle, 15 min = deep idle). The first mouse movement after wake may feel slightly delayed. |
+| **First input delay after idle** | The device enters power-saving mode after inactivity (10 sec = 1ms delay, 1 minute = 20ms delay, 5 min = 50ms delay, 15 min = 100ms delay). The first mouse movement after wake may feel slightly delayed. |
+
 | **Mouse rate is not 1000Hz** | Read spead of your mouse is pure 1:1 from your mouse settings (as long as device is capable of this rate. I did not test it with mouse that has higher than 1000Hz, but it does support 1000Hz input!). But output works differently, you have to update MOUSE_SEND_HZ variable and set it a value that is higher than actual mouse rate, for example for my keychrone m3 mini i get 1000Hz ouput rate when i set MOUSE_SEND_HZ to 1750-2000 (this number is more like code delay between iterations) |
 | **Battery status does not update** | If you don't use debug mode, the only way to update the screen is to press mouse4 to switch pc or to plug-out/in mouse dongle, this is made for performance reasons |
 
