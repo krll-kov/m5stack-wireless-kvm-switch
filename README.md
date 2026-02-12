@@ -1,6 +1,20 @@
 # m5stack-wireless-kvm-switch
 Wireless keyboard and mouse kvm switch (both IN and OUT) based on M5Stack CoreS3 SE and Atom S3U that can handle 1000 Hz wireless mouse and blueooth keyboard
 
+Setup used in this guide:
+	- M5GO/FIRE Battery Bottom Charging Base × 1
+	- AtomS3U ESP32S3 Development Kit with USB-A × 2
+	- M5GO Battery Bottom3 (for CoreS3 only) × 1
+	- M5Stack CoreS3 SE IoT Controller without Battery Bottom × 1
+  - M5Stack USB Module V1.2 - for M5Core × 1 (For legacy bluetooth connections)
+  - Bluetooth 4.0 USB Module × 1 (For legacy bluetooth connections)
+  - M3x25 DIN 912 A2 × 2 (to connect battery base + cores3 se + USB Module)
+  - M3x22 DIN 912 A2 × 2 (to connect battery base + cores3 se + USB Module)
+
+  - Apple magic keyboard (wireless with usb-c support 2021) × 1
+  - Keychrone m3 mini with wireless usb-c dongle × 1
+
+
 Setup guide (I'm using MacOS so it will be for Mac), but can be used on other OS, just download files for your OS:
 - Install Arduino IDE: https://www.arduino.cc/en/software
 - Insert Atom S3U (usb thing that looks like a flash drive) into MAC 
@@ -247,21 +261,30 @@ void loop() {
 - Paste this into sketch; You must change these values:
 uint8_t ATOM_MAC_1[] = {0x3C, 0xDC, 0x75, 0xED, 0xFB, 0x4C}; - mac address of first S3U dongle
 uint8_t ATOM_MAC_2[] = {0xD0, 0xCF, 0x13, 0x0F, 0x90, 0x48}; - mac address of second S3U dongle
-#define BLE_KBD_MATCH      "Magic Keyboard" - Part of keyboard name from bluetooth settings (do not use ' or other symbols, try simple search). For example i have Kyrylo's Magic Keyboard - I'm using just Magic Keyboard to look for keyboard.
+#define BLE_KBD_MATCH "Keyboard" - Part of keyboard name from bluetooth settings (do not use ' or other symbols, try simple search). For example i have Kyrylo's Magic Keyboard - I'm using just Keyboard to look for keyboard.
 MOUSE_SEND_HZ     750 - Hz of mouse (1000, 500, 750, etc). Lower this if you experiece lags or set to 1000hz if signal is good in your room
 bool m4 = (m.buttons & 0x08); - this sets switch button to Mouse4 
+#define USE_MAX_MODULE false - set to true if you attached classic usb module
+#define WITH_KEYBOARD true - set to false if you want to use it without keyboard (just mouse)
+#define BLE_PROBE_MIN_RSSI -55 - Set to -80 or higher if keyboard is far away from you (by default falls-back to nerby devices)
+
 ```ino
 #include <Arduino.h>
 #include <M5Unified.h>
 #include <NimBLEDevice.h>
+#include <SPI.h>
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "freertos/semphr.h"
 #include "freertos/task.h"
 #include "usb/usb_host.h"
+
+#define WITH_KEYBOARD true
+#define USE_MAX_MODULE false
 
 uint8_t ATOM_MAC_1[] = {0x3C, 0xDC, 0x75, 0xED, 0xFB, 0x4C};
 uint8_t ATOM_MAC_2[] = {0xD0, 0xCF, 0x13, 0x0F, 0x90, 0x48};
@@ -273,20 +296,58 @@ uint8_t ATOM_MAC_2[] = {0xD0, 0xCF, 0x13, 0x0F, 0x90, 0x48};
 #define SWITCH_DEBOUNCE_MS 300
 #define HEARTBEAT_MS 500
 #define BLE_SCAN_BUDGET_MS 20000
-#define SEEN_DEV_MAX 32
+#define SEEN_DEV_MAX 48
 #define SEEN_NAME_LEN 40
 #define BLE_PROBE_MAX 8
-#define BLE_PROBE_MIN_RSSI -80
-#define TOP_DISPLAY 12
+#define BLE_PROBE_MIN_RSSI -55
+#define SCAN_COL_ROWS 12
+#define TOP_DISPLAY (SCAN_COL_ROWS * 2)
 #define PASSKEY_DISPLAY_MS 30000
 #define APPLE_PAIR_TIMEOUT_MS 20000
 #define MAX_CONNECT_RETRIES 5
+#define SCAN_REDRAW_MS 1000
+#define BLE_SCAN_BURST_MS 3000
+#define BLE_SCAN_GAP_MS 200
+
+#if USE_MAX_MODULE
+#define MAX_CS_PIN 6
+#define MAX_INT_PIN 10
+#define MAX_MOSI_PIN 37
+#define MAX_MISO_PIN 35
+#define MAX_SCK_PIN 36
+#endif
+
+#if USE_MAX_MODULE
+#define rRCVFIFO 0x08
+#define rSNDFIFO 0x10
+#define rSUDFIFO 0x20
+#define rRCVBC 0x30
+#define rSNDBC 0x38
+#define rUSBIRQ 0x68
+#define rUSBCTL 0x78
+#define rPINCTL 0x88
+#define rREVISION 0x90
+#define rHIRQ 0xC8
+#define rHIEN 0xD0
+#define rMODE 0xD8
+#define rPERADDR 0xE0
+#define rHCTL 0xE8
+#define rHXFR 0xF0
+#define rHRSL 0xF8
+#endif
+
+#define tokSETUP 0x10
+#define tokIN 0x00
+#define tokOUT 0x20
+#define tokINHS 0x80
+#define tokOUTHS 0xA0
+#define hrSUCCESS 0x00
+#define hrNAK 0x04
 
 #define PKT_MOUSE 0x01
 #define PKT_KEYBOARD 0x02
 #define PKT_ACTIVATE 0x03
 #define PKT_DEACTIVATE 0x04
-#define PKT_HEARTBEAT 0x05
 
 #pragma pack(push, 1)
 typedef struct {
@@ -301,68 +362,135 @@ typedef struct {
 #pragma pack(pop)
 
 static QueueHandle_t mouseQueue, kbdQueue;
+static SemaphoreHandle_t seenMutex;
+#if USE_MAX_MODULE
+static SemaphoreHandle_t spiMutex;
+#endif
 static int activeTarget = 0;
-static bool mouse4Held = false;
 static volatile bool usbMouseReady = false;
 static volatile bool bleKbdConnected = false;
 static volatile int bleState = 0;
-static volatile uint32_t scanElapsedMs = 0;
 static char bleFoundName[64] = "";
 static char bleStatusMsg[64] = "";
+static char bleConnAddr[20] = "";
 static esp_now_peer_info_t peer1 = {}, peer2 = {};
-static mouse_evt_t mAccum = {};
-static bool mDirty = false;
-static uint32_t mLastSendUs = 0, lastSwitchMs = 0;
-static bool needRedraw = false;
+static uint32_t lastSwitchMs = 0;
+static volatile bool needRedraw = false;
 static volatile int bleMatchReason = 0;
 static volatile bool passkeyActive = false;
 static volatile uint32_t passkeyValue = 0, passkeyShownMs = 0;
 static volatile bool pairingSuccess = false, pairingDone = false;
-static volatile bool bleScanRequested = false;
+static volatile bool switchInProgress = false;
+static volatile bool switchRequest = false;
+static NimBLEClient *pc = nullptr;
+
+static NimBLEAddress knownKbdAddr;
+static volatile bool knownKbdValid = false;
+static volatile bool probesDone = false;
+
+static volatile bool maxPresent = false;
+static volatile bool maxDongleReady = false;
+static volatile bool classicScanRequest = false;
+static volatile bool classicScanDone = false;
+
+RTC_NOINIT_ATTR char rtcDbg[48];
+static bool wasReboot = false;
+
+static volatile uint32_t lastActivityMs = 0;
+#define IDLE1_TIMEOUT_MS  300000   // 5 min - light idle
+#define IDLE2_TIMEOUT_MS  900000   // 15 min — deep idle
+
+#define IDLE1_MOUSE_SEND_HZ 30
+#define IDLE2_MOUSE_SEND_HZ 2
+#define IDLE1_MOUSE_SEND_US (1000000 / IDLE1_MOUSE_SEND_HZ)
+#define IDLE2_MOUSE_SEND_US (1000000 / IDLE2_MOUSE_SEND_HZ)
+
+#define IDLE1_HEARTBEAT_MS 3000
+#define IDLE2_HEARTBEAT_MS 10000
+
+#define IDLE1_LOOP_MS 20
+#define IDLE2_LOOP_MS 100
+
+static int idleLevel() {
+  uint32_t dt = millis() - lastActivityMs;
+  if (dt > IDLE2_TIMEOUT_MS) return 2;
+  if (dt > IDLE1_TIMEOUT_MS) return 1;
+  return 0;
+}
 
 struct seen_dev_t {
   NimBLEAddress addr;
   char name[SEEN_NAME_LEN];
+  char mac_short[12];
   int rssi;
-  bool used, hasHidUuid, isApple;
+  bool used, hasHidUuid, isApple, isClassic;
 };
 static seen_dev_t seenDevs[SEEN_DEV_MAX];
 static volatile int seenDevCount = 0, bleScanTotal = 0;
 
 static char probeLog[BLE_PROBE_MAX * 2][52];
-static volatile int probeLogCount = 0;
-static volatile int probeTotalExpected = 0;
+static volatile int probeLogCount = 0, probeTotalExpected = 0;
+
+static void shortMac(const char *f, char *o, size_t s) {
+  if (strlen(f) >= 17)
+    snprintf(o, s, "%c%c:%c%c..%c%c", f[0], f[1], f[3], f[4], f[15], f[16]);
+  else {
+    strncpy(o, f, s - 1);
+    o[s - 1] = '\0';
+  }
+}
 
 static void resetSeenDevs() {
-  for (int i = 0; i < SEEN_DEV_MAX; i++) {
-    seenDevs[i].used = false;
-    seenDevs[i].isApple = false;
-  }
+  xSemaphoreTake(seenMutex, portMAX_DELAY);
+  for (int i = 0; i < SEEN_DEV_MAX; i++) seenDevs[i].used = false;
   seenDevCount = 0;
   bleScanTotal = 0;
+  xSemaphoreGive(seenMutex);
 }
-static int findSeenDev(const NimBLEAddress &addr) {
+static int findSeenDevLocked(const NimBLEAddress &a) {
   for (int i = 0; i < seenDevCount; i++)
-    if (seenDevs[i].used && seenDevs[i].addr == addr) return i;
+    if (seenDevs[i].used && seenDevs[i].addr == a) return i;
   return -1;
 }
 static int addSeenDev(const NimBLEAddress &addr, const char *name, int rssi,
-                      bool hasHid, bool apple = false) {
-  if (seenDevCount >= SEEN_DEV_MAX) return -1;
-  int i = seenDevCount++;
+                      bool hasHid, bool apple, bool classic) {
+  xSemaphoreTake(seenMutex, portMAX_DELAY);
+  int idx = findSeenDevLocked(addr);
+  if (idx >= 0) {
+    if (name && name[0] && seenDevs[idx].name[0] == '\0') {
+      strncpy(seenDevs[idx].name, name, SEEN_NAME_LEN - 1);
+      seenDevs[idx].name[SEEN_NAME_LEN - 1] = '\0';
+    }
+    if (apple) seenDevs[idx].isApple = true;
+    if (hasHid) seenDevs[idx].hasHidUuid = true;
+    if (rssi > seenDevs[idx].rssi) seenDevs[idx].rssi = rssi;
+    xSemaphoreGive(seenMutex);
+    return idx;
+  }
+  if (seenDevCount >= SEEN_DEV_MAX) {
+    xSemaphoreGive(seenMutex);
+    return -1;
+  }
+  int i = seenDevCount;
   seenDevs[i].addr = addr;
   seenDevs[i].rssi = rssi;
   seenDevs[i].used = true;
   seenDevs[i].hasHidUuid = hasHid;
   seenDevs[i].isApple = apple;
+  seenDevs[i].isClassic = classic;
+  shortMac(addr.toString().c_str(), seenDevs[i].mac_short,
+           sizeof(seenDevs[i].mac_short));
   if (name && name[0]) {
     strncpy(seenDevs[i].name, name, SEEN_NAME_LEN - 1);
     seenDevs[i].name[SEEN_NAME_LEN - 1] = '\0';
   } else
     seenDevs[i].name[0] = '\0';
+  seenDevCount = i + 1;
+  xSemaphoreGive(seenMutex);
   return i;
 }
 static int getTopByRssi(int *out, int maxOut) {
+  xSemaphoreTake(seenMutex, portMAX_DELAY);
   int all[SEEN_DEV_MAX], n = 0;
   for (int i = 0; i < seenDevCount && i < SEEN_DEV_MAX; i++)
     if (seenDevs[i].used) all[n++] = i;
@@ -375,74 +503,418 @@ static int getTopByRssi(int *out, int maxOut) {
       }
   int c = (n < maxOut) ? n : maxOut;
   for (int i = 0; i < c; i++) out[i] = all[i];
+  xSemaphoreGive(seenMutex);
   return c;
 }
 
 // ===================== ESP-NOW =====================
-static volatile int sendAckResult = -1;
-static void onEspNowSendDone(const uint8_t *mac, esp_now_send_status_t s) {
-  sendAckResult = (s == ESP_NOW_SEND_SUCCESS) ? 1 : 0;
-}
-static void sendRaw(uint8_t *mac, const uint8_t *data, size_t len) {
-  esp_now_send(mac, data, len);
-}
+static void onEspNowSendDone(const uint8_t *, esp_now_send_status_t) {}
 static uint8_t *activeMac() {
   return (activeTarget == 0) ? ATOM_MAC_1 : ATOM_MAC_2;
 }
 static uint8_t *inactiveMac() {
   return (activeTarget == 0) ? ATOM_MAC_2 : ATOM_MAC_1;
 }
-static void sendCmd(uint8_t *mac, uint8_t cmd) {
-  uint8_t p = cmd;
-  sendRaw(mac, &p, 1);
-}
-static bool sendCmdConfirmed(uint8_t *mac, uint8_t cmd) {
-  uint8_t p = cmd;
-  for (int i = 0; i < 3; i++) {
-    sendAckResult = -1;
-    if (esp_now_send(mac, &p, 1) != ESP_OK) {
-      delay(3);
-      continue;
-    }
-    uint32_t t = millis();
-    while (sendAckResult == -1 && millis() - t < 30) delay(1);
-    if (sendAckResult == 1) return true;
-    delay(3);
-  }
-  return false;
-}
+static void sendCmd(uint8_t *mac, uint8_t cmd) { esp_now_send(mac, &cmd, 1); }
 static void switchTarget() {
-  mAccum = {};
-  mDirty = false;
+  switchInProgress = true;
+  vTaskDelay(pdMS_TO_TICKS(2));
   xQueueReset(mouseQueue);
-  delay(15);
-  sendCmdConfirmed(activeMac(), PKT_DEACTIVATE);
+  sendCmd(activeMac(), PKT_DEACTIVATE);
   activeTarget = 1 - activeTarget;
-  sendCmdConfirmed(activeMac(), PKT_ACTIVATE);
+  sendCmd(activeMac(), PKT_ACTIVATE);
+  delayMicroseconds(800);
+  sendCmd(activeMac(), PKT_ACTIVATE);
   xQueueReset(mouseQueue);
   lastSwitchMs = millis();
+  switchInProgress = false;
   needRedraw = true;
 }
 static void txMouse(const mouse_evt_t *m) {
-  uint8_t p[7];
-  p[0] = PKT_MOUSE;
-  p[1] = m->buttons & 0x07;
-  p[2] = m->x & 0xFF;
-  p[3] = (m->x >> 8) & 0xFF;
-  p[4] = m->y & 0xFF;
-  p[5] = (m->y >> 8) & 0xFF;
-  p[6] = (uint8_t)m->wheel;
-  sendRaw(activeMac(), p, 7);
+  uint8_t p[7] = {PKT_MOUSE,
+                  (uint8_t)(m->buttons & 0x07),
+                  (uint8_t)(m->x & 0xFF),
+                  (uint8_t)((m->x >> 8) & 0xFF),
+                  (uint8_t)(m->y & 0xFF),
+                  (uint8_t)((m->y >> 8) & 0xFF),
+                  (uint8_t)m->wheel};
+  esp_now_send(activeMac(), p, 7);
 }
 static void txKbd(const kbd_evt_t *k) {
-  uint8_t p[8];
-  p[0] = PKT_KEYBOARD;
-  p[1] = k->modifiers;
+  uint8_t p[8] = {PKT_KEYBOARD, k->modifiers};
   memcpy(&p[2], k->keys, 6);
-  sendRaw(activeMac(), p, 8);
+  esp_now_send(activeMac(), p, 8);
 }
 
-// ===================== USB HOST =====================
+// ===================== MAX3421E DRIVER =====================
+#if USE_MAX_MODULE
+
+static SPIClass maxSPI(HSPI);
+static const SPISettings maxSPISet(10000000, MSBFIRST, SPI_MODE0);
+
+static uint8_t mxRd(uint8_t reg) {
+  uint8_t v = 0;
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY) == pdTRUE) {
+    maxSPI.beginTransaction(maxSPISet);
+    digitalWrite(MAX_CS_PIN, LOW);
+    maxSPI.transfer(reg);
+    v = maxSPI.transfer(0);
+    digitalWrite(MAX_CS_PIN, HIGH);
+    maxSPI.endTransaction();
+    xSemaphoreGive(spiMutex);
+  }
+  return v;
+}
+static void mxWr(uint8_t reg, uint8_t val) {
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY) == pdTRUE) {
+    maxSPI.beginTransaction(maxSPISet);
+    digitalWrite(MAX_CS_PIN, LOW);
+    maxSPI.transfer(reg | 0x02);
+    maxSPI.transfer(val);
+    digitalWrite(MAX_CS_PIN, HIGH);
+    maxSPI.endTransaction();
+    xSemaphoreGive(spiMutex);
+  }
+}
+static void mxWrN(uint8_t reg, const uint8_t *d, int n) {
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY) == pdTRUE) {
+    maxSPI.beginTransaction(maxSPISet);
+    digitalWrite(MAX_CS_PIN, LOW);
+    maxSPI.transfer(reg | 0x02);
+    for (int i = 0; i < n; i++) maxSPI.transfer(d[i]);
+    digitalWrite(MAX_CS_PIN, HIGH);
+    maxSPI.endTransaction();
+    xSemaphoreGive(spiMutex);
+  }
+}
+static void mxRdN(uint8_t reg, uint8_t *d, int n) {
+  if (xSemaphoreTake(spiMutex, portMAX_DELAY) == pdTRUE) {
+    maxSPI.beginTransaction(maxSPISet);
+    digitalWrite(MAX_CS_PIN, LOW);
+    maxSPI.transfer(reg);
+    for (int i = 0; i < n; i++) d[i] = maxSPI.transfer(0);
+    digitalWrite(MAX_CS_PIN, HIGH);
+    maxSPI.endTransaction();
+    xSemaphoreGive(spiMutex);
+  }
+}
+
+static bool mxWaitHXFR(int tmoMs = 500) {
+  uint32_t t0 = millis();
+  while (!(mxRd(rHIRQ) & 0x80)) {
+    if ((int)(millis() - t0) > tmoMs) return false;
+    vTaskDelay(1);
+  }
+  mxWr(rHIRQ, 0x80);
+  return true;
+}
+
+static uint8_t mxXfer(uint8_t token, uint8_t ep, int nakLimit = 300) {
+  for (int naks = 0; naks <= nakLimit; naks++) {
+    mxWr(rHXFR, token | ep);
+    if (!mxWaitHXFR()) return 0xFF;
+    uint8_t r = mxRd(rHRSL) & 0x0F;
+    if (r != hrNAK) return r;
+    vTaskDelay(1);
+  }
+  return hrNAK;
+}
+
+static bool mxCtrlWrite(uint8_t addr, uint8_t bmRT, uint8_t bReq, uint16_t wVal,
+                        uint16_t wIdx, uint16_t wLen, const uint8_t *data) {
+  mxWr(rPERADDR, addr);
+  uint8_t setup[8] = {bmRT,
+                      bReq,
+                      (uint8_t)(wVal & 0xFF),
+                      (uint8_t)(wVal >> 8),
+                      (uint8_t)(wIdx & 0xFF),
+                      (uint8_t)(wIdx >> 8),
+                      (uint8_t)(wLen & 0xFF),
+                      (uint8_t)(wLen >> 8)};
+  mxWrN(rSUDFIFO, setup, 8);
+  if (mxXfer(tokSETUP, 0, 5) != hrSUCCESS) return false;
+  if (wLen > 0 && data) {
+    uint16_t sent = 0;
+    uint8_t toggle = 1;
+    while (sent < wLen) {
+      uint16_t chunk = wLen - sent;
+      if (chunk > 64) chunk = 64;
+      mxWr(rHCTL, toggle ? 0x80 : 0x40);
+      mxWrN(rSNDFIFO, data + sent, chunk);
+      mxWr(rSNDBC, chunk);
+      if (mxXfer(tokOUT, 0, 200) != hrSUCCESS) return false;
+      sent += chunk;
+      toggle ^= 1;
+    }
+  }
+  return mxXfer(tokINHS, 0, 200) == hrSUCCESS;
+}
+
+static int mxCtrlRead(uint8_t addr, uint8_t bmRT, uint8_t bReq, uint16_t wVal,
+                      uint16_t wIdx, uint16_t wLen, uint8_t *buf) {
+  mxWr(rPERADDR, addr);
+  uint8_t setup[8] = {bmRT,
+                      bReq,
+                      (uint8_t)(wVal & 0xFF),
+                      (uint8_t)(wVal >> 8),
+                      (uint8_t)(wIdx & 0xFF),
+                      (uint8_t)(wIdx >> 8),
+                      (uint8_t)(wLen & 0xFF),
+                      (uint8_t)(wLen >> 8)};
+  mxWrN(rSUDFIFO, setup, 8);
+  if (mxXfer(tokSETUP, 0, 5) != hrSUCCESS) return -1;
+  int total = 0;
+  uint8_t toggle = 1;
+  while (total < wLen) {
+    mxWr(rHCTL, toggle ? 0x20 : 0x10);
+    uint8_t r = mxXfer(tokIN, 0, 200);
+    if (r != hrSUCCESS) break;
+    int bc = mxRd(rRCVBC);
+    if (bc > 0) {
+      if (total + bc > wLen) bc = wLen - total;
+      mxRdN(rRCVFIFO, buf + total, bc);
+    }
+    total += bc;
+    toggle ^= 1;
+    if (bc < 64) break;
+  }
+  mxXfer(tokOUTHS, 0, 200);
+  return total;
+}
+
+static uint8_t mxEvtToggle = 0;
+static int mxIntrIn(uint8_t addr, uint8_t ep, uint8_t *buf, int maxLen) {
+  mxWr(rPERADDR, addr);
+  mxWr(rHCTL, mxEvtToggle ? 0x20 : 0x10);
+  mxWr(rHXFR, tokIN | ep);
+  if (!mxWaitHXFR(100)) return -1;
+  uint8_t r = mxRd(rHRSL) & 0x0F;
+  if (r == hrNAK) return 0;
+  if (r != hrSUCCESS) return -1;
+  int bc = mxRd(rRCVBC);
+  if (bc > maxLen) bc = maxLen;
+  if (bc > 0) mxRdN(rRCVFIFO, buf, bc);
+  mxEvtToggle ^= 1;
+  return bc;
+}
+
+static uint8_t mxBtAddr = 0, mxBtEvtEp = 0;
+
+static bool mxChipInit() {
+  pinMode(MAX_CS_PIN, OUTPUT);
+  digitalWrite(MAX_CS_PIN, HIGH);
+  pinMode(MAX_INT_PIN, INPUT);
+  maxSPI.begin(MAX_SCK_PIN, MAX_MISO_PIN, MAX_MOSI_PIN, -1);
+  mxWr(rUSBCTL, 0x20);
+  delay(30);
+  mxWr(rUSBCTL, 0x00);
+  uint32_t t0 = millis();
+  while (!(mxRd(rUSBIRQ) & 0x01)) {
+    if (millis() - t0 > 1000) return false;
+    delay(5);
+  }
+  uint8_t rev = mxRd(rREVISION);
+  if (rev == 0x00 || rev == 0xFF) return false;
+  mxWr(rPINCTL, 0x10);
+  mxWr(rMODE, 0x01 | 0x40 | 0x20 | 0x08);
+  mxWr(rHIRQ, 0xFF);
+  mxWr(rHIEN, 0x60);
+  return true;
+}
+static bool mxWaitConnect(int tmoMs) {
+  uint32_t t0 = millis();
+  while ((int)(millis() - t0) < tmoMs) {
+    uint8_t hirq = mxRd(rHIRQ);
+    if (hirq & 0x20) {
+      mxWr(rHIRQ, 0x20);
+      if (mxRd(rHRSL) & 0xC0) return true;
+    }
+    vTaskDelay(pdMS_TO_TICKS(50));
+  }
+  return false;
+}
+static bool mxBusReset() {
+  mxWr(rHCTL, 0x01);
+  uint32_t t0 = millis();
+  while (mxRd(rHCTL) & 0x01) {
+    if (millis() - t0 > 2000) return false;
+    delay(10);
+  }
+  delay(200);
+  uint8_t hrsl = mxRd(rHRSL);
+  bool ls = (hrsl & 0x40) && !(hrsl & 0x80);
+  uint8_t mode = mxRd(rMODE);
+  if (ls)
+    mode |= 0x02;
+  else
+    mode &= ~0x02;
+  mxWr(rMODE, mode);
+  mxWr(rHIRQ, 0x04);
+  delay(20);
+  return true;
+}
+static bool mxEnumerateBt() {
+  uint8_t buf[128];
+  if (mxCtrlRead(0, 0x80, 0x06, 0x0100, 0, 8, buf) < 8) return false;
+  if (!mxCtrlWrite(0, 0x00, 0x05, 1, 0, 0, NULL)) return false;
+  delay(20);
+  mxBtAddr = 1;
+  int n = mxCtrlRead(1, 0x80, 0x06, 0x0100, 0, 18, buf);
+  if (n < 8) return false;
+  bool isBtDev = (buf[4] == 0xE0 && buf[5] == 0x01 && buf[6] == 0x01);
+  n = mxCtrlRead(1, 0x80, 0x06, 0x0200, 0, 128, buf);
+  if (n < 4) return false;
+  uint16_t total = buf[2] | (buf[3] << 8);
+  if (total > (uint16_t)n) total = n;
+  bool isBtIf = false;
+  mxBtEvtEp = 0;
+  int off = 0;
+  while (off < total) {
+    uint8_t dL = buf[off];
+    if (!dL) break;
+    uint8_t dT = (off + 1 < total) ? buf[off + 1] : 0;
+    if (dT == 0x04 && dL >= 9) {
+      isBtIf = (buf[off + 5] == 0xE0 && buf[off + 6] == 0x01 &&
+                buf[off + 7] == 0x01);
+      if (!isBtDev && isBtIf) isBtDev = true;
+    }
+    if (dT == 0x05 && dL >= 7 && (isBtIf || isBtDev)) {
+      uint8_t ea = buf[off + 2], et = buf[off + 3] & 0x03;
+      if (et == 0x03 && (ea & 0x80) && !mxBtEvtEp) mxBtEvtEp = ea & 0x0F;
+    }
+    off += dL;
+  }
+  if (!isBtDev || !mxBtEvtEp) return false;
+  if (!mxCtrlWrite(1, 0x00, 0x09, buf[5], 0, 0, NULL)) return false;
+  delay(50);
+  mxEvtToggle = 0;
+  return true;
+}
+static bool mxHciCmd(uint16_t op, const uint8_t *par, uint8_t pl) {
+  uint8_t cmd[259];
+  cmd[0] = op & 0xFF;
+  cmd[1] = (op >> 8) & 0xFF;
+  cmd[2] = pl;
+  if (pl > 0 && par) memcpy(&cmd[3], par, pl);
+  return mxCtrlWrite(mxBtAddr, 0x20, 0x00, 0, 0, 3 + pl, cmd);
+}
+static bool mxHciWaitComplete(uint16_t op, int tmo) {
+  uint8_t evt[64];
+  uint32_t t0 = millis();
+  while ((int)(millis() - t0) < tmo) {
+    int n = mxIntrIn(mxBtAddr, mxBtEvtEp, evt, sizeof(evt));
+    if (n >= 6 && evt[0] == 0x0E) {
+      if ((evt[3] | (evt[4] << 8)) == op) return evt[5] == 0;
+    }
+    vTaskDelay(pdMS_TO_TICKS(5));
+  }
+  return false;
+}
+static void mxParseInqResult(const uint8_t *evt, int len) {
+  if (len < 2) return;
+  uint8_t code = evt[0], plen = evt[1];
+  const uint8_t *p = &evt[2];
+  if (plen < 1) return;
+  if (code == 0x2F && plen >= 15) {
+    uint8_t bd[6];
+    for (int b = 0; b < 6; b++) bd[b] = p[5 - b];
+    int8_t rssi = (int8_t)p[13];
+    bool hasHid = ((p[10] & 0x1F) == 5);
+    char name[SEEN_NAME_LEN] = "";
+    if (plen >= 15 + 240) {
+      const uint8_t *eir = &p[14];
+      int eo = 0;
+      while (eo < 238 && eir[eo]) {
+        uint8_t tl = eir[eo], tt = eir[eo + 1];
+        if ((tt == 0x08 || tt == 0x09) && tl > 1) {
+          int nl = (tl - 1 < SEEN_NAME_LEN - 1) ? tl - 1 : SEEN_NAME_LEN - 1;
+          memcpy(name, &eir[eo + 2], nl);
+          name[nl] = '\0';
+        }
+        eo += tl + 1;
+      }
+    }
+    char as[18];
+    snprintf(as, sizeof(as), "%02x:%02x:%02x:%02x:%02x:%02x", bd[0], bd[1],
+             bd[2], bd[3], bd[4], bd[5]);
+    addSeenDev(NimBLEAddress(as, 0), name, rssi, hasHid, false, true);
+    needRedraw = true;
+  } else if (code == 0x22 && plen >= 2) {
+    int numR = p[0];
+    const uint8_t *r = &p[1];
+    for (int i = 0; i < numR; i++) {
+      if ((int)((r - &p[1]) + 14) > plen - 1) break;
+      uint8_t bd[6];
+      for (int b = 0; b < 6; b++) bd[b] = r[5 - b];
+      char as[18];
+      snprintf(as, sizeof(as), "%02x:%02x:%02x:%02x:%02x:%02x", bd[0], bd[1],
+               bd[2], bd[3], bd[4], bd[5]);
+      addSeenDev(NimBLEAddress(as, 0), "", (int8_t)r[13], ((r[10] & 0x1F) == 5),
+                 false, true);
+      r += 14;
+    }
+    needRedraw = true;
+  }
+}
+
+void max3421Task(void *) {
+  if (!mxChipInit()) {
+    vTaskDelete(NULL);
+    return;
+  }
+  maxPresent = true;
+  needRedraw = true;
+  bool ready = false;
+  for (int att = 0; att < 10 && !ready; att++) {
+    if (mxWaitConnect(5000) && mxBusReset()) {
+      delay(100);
+      if (mxEnumerateBt() && mxHciCmd(0x0C03, NULL, 0) &&
+          mxHciWaitComplete(0x0C03, 3000)) {
+        uint8_t m = 2;
+        if (mxHciCmd(0x0C45, &m, 1)) mxHciWaitComplete(0x0C45, 1000);
+        maxDongleReady = true;
+        ready = true;
+        needRedraw = true;
+      }
+    }
+    if (!ready) vTaskDelay(pdMS_TO_TICKS(2000));
+  }
+  if (!ready) {
+    maxPresent = false;
+    vTaskDelete(NULL);
+    return;
+  }
+  bool inqAct = false;
+  while (true) {
+    if (classicScanRequest && !inqAct) {
+      uint8_t par[5] = {0x33, 0x8B, 0x9E, 0x08, 0x00};
+      if (mxHciCmd(0x0401, par, 5)) {
+        inqAct = true;
+        classicScanDone = false;
+      } else {
+        classicScanDone = true;
+        classicScanRequest = false;
+      }
+    }
+    uint8_t evt[270];
+    int n = mxIntrIn(mxBtAddr, mxBtEvtEp, evt, sizeof(evt));
+    if (n > 2) {
+      if (evt[0] == 0x01) {
+        inqAct = false;
+        classicScanDone = true;
+        classicScanRequest = false;
+        needRedraw = true;
+      } else if (evt[0] == 0x22 || evt[0] == 0x2F)
+        mxParseInqResult(evt, n);
+    }
+    vTaskDelay(pdMS_TO_TICKS(20));
+  }
+}
+#else
+void max3421Task(void *) { vTaskDelete(NULL); }
+#endif
+
+// ===================== USB MOUSE HOST =====================
 static usb_host_client_handle_t usbClient = NULL;
 static usb_device_handle_t usbDev = NULL;
 static usb_transfer_t *xferIn = NULL;
@@ -451,8 +923,13 @@ static volatile bool devGone = false, xferDead = false;
 static uint32_t xferDeadMs = 0;
 
 static void mouseXferCb(usb_transfer_t *xfer) {
+  if (switchInProgress) {
+    if (usbDev && xferIn) usb_host_transfer_submit(xferIn);
+    return;
+  }
   if (xfer->status == USB_TRANSFER_STATUS_COMPLETED &&
       xfer->actual_num_bytes > 0) {
+    lastActivityMs = millis();
     uint8_t *d = xfer->data_buffer;
     int len = xfer->actual_num_bytes;
     mouse_evt_t evt = {};
@@ -521,8 +998,8 @@ static bool findHidEp() {
   uint8_t curIf = 0;
   bool isH = false;
   while (off < total) {
-    uint8_t dL = p[off], dT = p[off + 1];
-    if (dL == 0) break;
+    uint8_t dL = p[off], dT = (dL >= 2) ? p[off + 1] : 0;
+    if (!dL) break;
     if (dT == 0x04 && dL >= 9) {
       curIf = p[off + 2];
       isH = (p[off + 5] == 3);
@@ -564,7 +1041,6 @@ void usbHostTask(void *) {
   cc.is_synchronous = false;
   cc.max_num_event_msg = 5;
   cc.async.client_event_callback = usbEventCb;
-  cc.async.callback_arg = NULL;
   usb_host_client_register(&cc, &usbClient);
   while (true) {
     usb_host_lib_handle_events(1, NULL);
@@ -575,7 +1051,7 @@ void usbHostTask(void *) {
       needRedraw = true;
     }
     if (xferDead && usbDev && xferIn) {
-      if (xferDeadMs == 0) xferDeadMs = millis();
+      if (!xferDeadMs) xferDeadMs = millis();
       if (millis() - xferDeadMs > 3000) {
         cleanupUsb();
         needRedraw = true;
@@ -598,11 +1074,64 @@ void usbHostTask(void *) {
   }
 }
 
-// ===================== BLE SECURITY =====================
+// ===================== MOUSE SEND TASK =====================
+void mouseSendTask(void *) {
+  mouse_evt_t m, acc = {};
+  uint8_t prevBtn = 0;
+  bool dirty = false, m4h = false;
+  uint32_t lastUs = 0;
+  while (true) {
+    if (switchInProgress) {
+      acc = {};
+      dirty = false;
+      prevBtn = 0;
+      m4h = false;
+      vTaskDelay(pdMS_TO_TICKS(2));
+      continue;
+    }
+    int waitMs = (idleLevel() >= 2) ? 50 : (idleLevel() == 1) ? 5 : 1;
+    bool got = xQueueReceive(mouseQueue, &m, pdMS_TO_TICKS(waitMs)) == pdTRUE;
+    if (got && !switchInProgress) {
+      bool m4 = (m.buttons & 0x08);
+      if (m4 && !m4h && millis() - lastSwitchMs > SWITCH_DEBOUNCE_MS)
+        switchRequest = true;
+      m4h = m4;
+      uint8_t b3 = m.buttons & 0x07;
+      bool bc = (b3 != prevBtn);
+      acc.buttons = m.buttons;
+      acc.x += m.x;
+      acc.y += m.y;
+      acc.wheel += m.wheel;
+      dirty = true;
+      if (bc) {
+        txMouse(&acc);
+        prevBtn = b3;
+        acc = {};
+        acc.buttons = m.buttons;
+        dirty = false;
+        lastUs = micros();
+      }
+    }
+
+    uint32_t sendInterval;
+    switch (idleLevel()) {
+      case 2:  sendInterval = IDLE2_MOUSE_SEND_US; break;
+      case 1:  sendInterval = IDLE1_MOUSE_SEND_US; break;
+      default: sendInterval = MOUSE_SEND_US; break;
+    }
+    if (dirty && micros() - lastUs >= sendInterval) {
+      txMouse(&acc);
+      acc = {};
+      dirty = false;
+      lastUs = micros();
+    }
+  }
+}
+
+// ===================== BLE =====================
 class SecurityCallbacks : public NimBLEClientCallbacks {
   void onPassKeyEntry(NimBLEConnInfo &ci) override {
     uint32_t pk = esp_random() % 1000000;
-    Serial.printf("[SEC] passkey=%06d\n", pk);
     passkeyValue = pk;
     passkeyActive = true;
     passkeyShownMs = millis();
@@ -622,49 +1151,42 @@ class SecurityCallbacks : public NimBLEClientCallbacks {
   void onAuthenticationComplete(NimBLEConnInfo &ci) override {
     pairingDone = true;
     pairingSuccess = (ci.isEncrypted() || ci.isBonded());
-    Serial.printf("[SEC] auth: %s\n", pairingSuccess ? "OK" : "FAIL");
     needRedraw = true;
   }
-  void onDisconnect(NimBLEClient *, int reason) override {
-    Serial.printf("[SEC] disconnect %d\n", reason);
-  }
+  void onDisconnect(NimBLEClient *, int) override {}
 };
 static SecurityCallbacks secCb;
 static NimBLEAddress bleAddr;
 static volatile bool bleFound = false, bleScanDone = false;
 static uint32_t lastScanRedraw = 0;
 
-static void setProbeSecurityMode() {
+static void setProbeSecMode() {
   NimBLEDevice::setSecurityAuth(true, false, true);
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_NO_INPUT_OUTPUT);
 }
-static void setKeyboardSecurityMode() {
+static void setKbdSecMode() {
   NimBLEDevice::setSecurityAuth(true, true, true);
   NimBLEDevice::setSecurityIOCap(BLE_HS_IO_DISPLAY_ONLY);
 }
-
-static bool nameContains(const std::string &hay, const char *needle) {
-  if (hay.empty()) return false;
-  std::string h = hay, n = needle;
-  for (auto &c : h) c = tolower(c);
-  for (auto &c : n) c = tolower(c);
-  return h.find(n) != std::string::npos;
+static bool nameContains(const std::string &h, const char *n) {
+  if (h.empty()) return false;
+  std::string a = h, b = n;
+  for (auto &c : a) c = tolower(c);
+  for (auto &c : b) c = tolower(c);
+  return a.find(b) != std::string::npos;
 }
-
-// ===== wait for disconnect to actually complete =====
-static void waitDisconnect(NimBLEClient *c, int timeoutMs = 2000) {
-  if (!c->isConnected()) return;
+static void waitDisconn(NimBLEClient *c, int tmo = 2000) {
+  if (!c || !c->isConnected()) return;
   c->disconnect();
   uint32_t t0 = millis();
-  while (c->isConnected() && (int)(millis() - t0) < timeoutMs)
+  while (c->isConnected() && (int)(millis() - t0) < tmo)
     vTaskDelay(pdMS_TO_TICKS(50));
-  vTaskDelay(pdMS_TO_TICKS(200));  // controller settle
+  vTaskDelay(pdMS_TO_TICKS(200));
 }
 
 class ScanCb : public NimBLEScanCallbacks {
   void onResult(const NimBLEAdvertisedDevice *dev) override {
     bleScanTotal++;
-    NimBLEAddress addr = dev->getAddress();
     std::string name = dev->getName();
     int rssi = dev->getRSSI();
     bool hasHid = dev->isAdvertisingService(NimBLEUUID("1812"));
@@ -675,22 +1197,10 @@ class ScanCb : public NimBLEScanCallbacks {
           ((uint8_t)mfr[0] | ((uint8_t)mfr[1] << 8)) == 0x004C)
         isApple = true;
     }
-    int idx = findSeenDev(addr);
-    if (idx == -1) {
-      idx = addSeenDev(addr, name.c_str(), rssi, hasHid, isApple);
-    } else {
-      if (name.length() > 0 && seenDevs[idx].name[0] == '\0') {
-        strncpy(seenDevs[idx].name, name.c_str(), SEEN_NAME_LEN - 1);
-        seenDevs[idx].name[SEEN_NAME_LEN - 1] = '\0';
-      }
-      if (isApple) seenDevs[idx].isApple = true;
-      if (hasHid) seenDevs[idx].hasHidUuid = true;
-      if (rssi > seenDevs[idx].rssi) seenDevs[idx].rssi = rssi;
-    }
+    addSeenDev(dev->getAddress(), name.c_str(), rssi, hasHid, isApple, false);
     if (nameContains(name, BLE_KBD_MATCH)) {
       strncpy(bleFoundName, name.c_str(), sizeof(bleFoundName) - 1);
-      bleFoundName[sizeof(bleFoundName) - 1] = '\0';
-      bleAddr = addr;
+      bleAddr = dev->getAddress();
       bleFound = true;
       bleMatchReason = 1;
       bleState = 2;
@@ -699,9 +1209,9 @@ class ScanCb : public NimBLEScanCallbacks {
       return;
     }
     if (hasHid) {
-      const char *l = name.empty() ? "(HID no name)" : name.c_str();
-      strncpy(bleFoundName, l, sizeof(bleFoundName) - 1);
-      bleAddr = addr;
+      strncpy(bleFoundName, name.empty() ? "(HID)" : name.c_str(),
+              sizeof(bleFoundName) - 1);
+      bleAddr = dev->getAddress();
       bleFound = true;
       bleMatchReason = 2;
       bleState = 2;
@@ -709,7 +1219,7 @@ class ScanCb : public NimBLEScanCallbacks {
       NimBLEDevice::getScan()->stop();
       return;
     }
-    if (millis() - lastScanRedraw > 500) {
+    if (millis() - lastScanRedraw > SCAN_REDRAW_MS) {
       needRedraw = true;
       lastScanRedraw = millis();
     }
@@ -719,24 +1229,24 @@ class ScanCb : public NimBLEScanCallbacks {
   }
 };
 static ScanCb scanCbInstance;
-
-static void bleReportCb(NimBLERemoteCharacteristic *, uint8_t *data, size_t len,
+static void bleReportCb(NimBLERemoteCharacteristic *, uint8_t *d, size_t l,
                         bool) {
-  if (len < 8) return;
+  if (l < 8) return;
+  lastActivityMs = millis();
   kbd_evt_t evt;
-  evt.modifiers = data[0];
-  memcpy(evt.keys, &data[2], 6);
+  evt.modifiers = d[0];
+  memcpy(evt.keys, &d[2], 6);
   xQueueSend(kbdQueue, &evt, 0);
 }
 
-// ===== Phase 2: quick probe, REUSES client =====
-// returns -1=fail, 0=no HID, 1=HID
-static int simpleProbeHid(NimBLEClient *c, const NimBLEAddress &addr,
-                          char *outName, size_t nameLen) {
-  outName[0] = '\0';
-  int result = -1;
-  if (c->connect(addr)) {
-    result = 0;
+static int probeHid(NimBLEClient *c, const NimBLEAddress &a, char *on,
+                    size_t nl) {
+  on[0] = '\0';
+  int r = -1;
+  if (!c) return r;
+  if (c->isConnected()) waitDisconn(c);
+  if (c->connect(a)) {
+    r = 0;
     if (c->isConnected()) {
       NimBLERemoteService *gap = c->getService(NimBLEUUID("1800"));
       if (gap && c->isConnected()) {
@@ -745,129 +1255,88 @@ static int simpleProbeHid(NimBLEClient *c, const NimBLEAddress &addr,
         if (nm && nm->canRead() && c->isConnected()) {
           std::string gn = nm->readValue();
           if (!gn.empty()) {
-            strncpy(outName, gn.c_str(), nameLen - 1);
-            outName[nameLen - 1] = '\0';
+            strncpy(on, gn.c_str(), nl - 1);
+            on[nl - 1] = '\0';
           }
         }
       }
-      if (c->isConnected()) {
-        NimBLERemoteService *hid = c->getService(NimBLEUUID("1812"));
-        if (hid) result = 1;
-      }
+      if (c->isConnected() && c->getService(NimBLEUUID("1812"))) r = 1;
     }
-    waitDisconnect(c);
+    waitDisconn(c);
   }
-  return result;
+  return r;
 }
 
-static void doQuickProbe(NimBLEClient *c, int seenIdx, int probeNum,
-                         int total) {
-  seen_dev_t &dev = seenDevs[seenIdx];
-  snprintf(bleStatusMsg, sizeof(bleStatusMsg), "probe %d/%d rssi=%d", probeNum,
-           total, dev.rssi);
+static void doProbe(NimBLEClient *c, int si, int pn, int tot) {
+  if (si < 0 || si >= SEEN_DEV_MAX || !seenDevs[si].used) return;
+  seen_dev_t &d = seenDevs[si];
+  snprintf(bleStatusMsg, sizeof(bleStatusMsg), "probe %d/%d %s", pn, tot,
+           d.mac_short);
   bleState = 6;
   needRedraw = true;
-  Serial.printf("[BLE] probe %d/%d: %s rssi=%d heap=%d\n", probeNum, total,
-                dev.addr.toString().c_str(), dev.rssi,
-                esp_get_free_heap_size());
-
-  int logIdx = -1;
-  if (probeLogCount < BLE_PROBE_MAX * 2) {
-    logIdx = probeLogCount++;
-    snprintf(probeLog[logIdx], sizeof(probeLog[0]), "%d/%d %s [%d] ...",
-             probeNum, total, dev.addr.toString().c_str() + 9, dev.rssi);
-    needRedraw = true;
-  }
-
-  char probeName[SEEN_NAME_LEN] = "";
-  int r = simpleProbeHid(c, dev.addr, probeName, sizeof(probeName));
-  const char *res = (r == 1) ? "HID!" : (r == 0) ? "no HID" : "fail";
-
-  if (logIdx >= 0) {
-    if (probeName[0])
-      snprintf(probeLog[logIdx], sizeof(probeLog[0]), "%d/%d %s [%d] %s \"%s\"",
-               probeNum, total, dev.addr.toString().c_str() + 9, dev.rssi, res,
-               probeName);
+  int li = (probeLogCount < BLE_PROBE_MAX * 2) ? probeLogCount++ : -1;
+  if (li >= 0)
+    snprintf(probeLog[li], sizeof(probeLog[0]), "%d/%d %c(%s)[%d] ..", pn, tot,
+             d.isClassic ? 'C' : 'B', d.mac_short, d.rssi);
+  char pn2[SEEN_NAME_LEN] = "";
+  int r = probeHid(c, d.addr, pn2, sizeof(pn2));
+  const char *rs = (r == 1) ? "HID!" : (r == 0) ? "noHID" : "fail";
+  if (li >= 0) {
+    if (pn2[0])
+      snprintf(probeLog[li], sizeof(probeLog[0]), "%d/%d %c(%s)[%d] %s \"%s\"",
+               pn, tot, d.isClassic ? 'C' : 'B', d.mac_short, d.rssi, rs, pn2);
     else
-      snprintf(probeLog[logIdx], sizeof(probeLog[0]), "%d/%d %s [%d] %s",
-               probeNum, total, dev.addr.toString().c_str() + 9, dev.rssi, res);
-    needRedraw = true;
+      snprintf(probeLog[li], sizeof(probeLog[0]), "%d/%d %c(%s)[%d] %s", pn,
+               tot, d.isClassic ? 'C' : 'B', d.mac_short, d.rssi, rs);
   }
-
+  needRedraw = true;
   if (r == 1) {
-    bleAddr = dev.addr;
+    bleAddr = d.addr;
     bleFound = true;
-    if (probeName[0]) {
-      strncpy(dev.name, probeName, SEEN_NAME_LEN - 1);
-      dev.name[SEEN_NAME_LEN - 1] = '\0';
-    }
     bleMatchReason =
-        (probeName[0] && nameContains(std::string(probeName), BLE_KBD_MATCH))
-            ? 3
-            : 4;
-    const char *label = probeName[0] ? probeName : "(HID device)";
-    strncpy(bleFoundName, label, sizeof(bleFoundName) - 1);
-    bleFoundName[sizeof(bleFoundName) - 1] = '\0';
+        (pn2[0] && nameContains(std::string(pn2), BLE_KBD_MATCH)) ? 3 : 4;
+    strncpy(bleFoundName, pn2[0] ? pn2 : "(HID)", sizeof(bleFoundName) - 1);
     bleState = 2;
     needRedraw = true;
   }
 }
 
-// ===== Phase 3: Apple full-security probe, REUSES client =====
-static void doAppleSecurityProbe(NimBLEClient *c, int seenIdx, int probeNum,
-                                 int total) {
-  seen_dev_t &dev = seenDevs[seenIdx];
-  snprintf(bleStatusMsg, sizeof(bleStatusMsg), "APL %d/%d rssi=%d", probeNum,
-           total, dev.rssi);
+static void doAppleProbe(NimBLEClient *c, int si, int pn, int tot) {
+  if (si < 0 || si >= SEEN_DEV_MAX || !seenDevs[si].used) return;
+  seen_dev_t &d = seenDevs[si];
+  snprintf(bleStatusMsg, sizeof(bleStatusMsg), "APL %d/%d %s", pn, tot,
+           d.mac_short);
   bleState = 6;
   needRedraw = true;
-  Serial.printf("[BLE] Apple probe %d/%d: %s rssi=%d heap=%d\n", probeNum,
-                total, dev.addr.toString().c_str(), dev.rssi,
-                esp_get_free_heap_size());
-
-  int logIdx = -1;
-  if (probeLogCount < BLE_PROBE_MAX * 2) {
-    logIdx = probeLogCount++;
-    snprintf(probeLog[logIdx], sizeof(probeLog[0]),
-             "APL %d/%d %s [%d] pairing...", probeNum, total,
-             dev.addr.toString().c_str() + 9, dev.rssi);
-    needRedraw = true;
-  }
-
+  int li = (probeLogCount < BLE_PROBE_MAX * 2) ? probeLogCount++ : -1;
+  if (li >= 0)
+    snprintf(probeLog[li], sizeof(probeLog[0]), "%d/%d B(%s)[%d] pair..", pn,
+             tot, d.mac_short, d.rssi);
   passkeyActive = false;
   pairingDone = false;
   pairingSuccess = false;
-
-  if (!c->connect(dev.addr)) {
-    if (logIdx >= 0)
-      snprintf(probeLog[logIdx], sizeof(probeLog[0]),
-               "APL %d/%d %s [%d] no conn", probeNum, total,
-               dev.addr.toString().c_str() + 9, dev.rssi);
+  if (c->isConnected()) waitDisconn(c);
+  if (!c->connect(d.addr)) {
+    if (li >= 0)
+      snprintf(probeLog[li], sizeof(probeLog[0]), "%d/%d B(%s)[%d] no conn", pn,
+               tot, d.mac_short, d.rssi);
     needRedraw = true;
     passkeyActive = false;
     return;
   }
-
-  NimBLERemoteService *hid = nullptr;
-  if (c->isConnected()) hid = c->getService(NimBLEUUID("1812"));
-
-  // wait for passkey if triggered
+  NimBLERemoteService *hid =
+      c->isConnected() ? c->getService(NimBLEUUID("1812")) : nullptr;
   if (!hid && passkeyActive && !pairingDone && c->isConnected()) {
-    Serial.println("[BLE] Apple passkey triggered");
-    snprintf(bleStatusMsg, sizeof(bleStatusMsg), "type PIN on keyboard!");
+    snprintf(bleStatusMsg, sizeof(bleStatusMsg), "type PIN on kbd!");
     needRedraw = true;
     uint32_t t0 = millis();
     while (!pairingDone && c->isConnected() &&
            (millis() - t0 < APPLE_PAIR_TIMEOUT_MS))
       vTaskDelay(pdMS_TO_TICKS(100));
   }
-
-  if (!hid && pairingDone && pairingSuccess && c->isConnected()) {
-    Serial.println("[BLE] Apple paired, checking HID...");
+  if (!hid && pairingDone && pairingSuccess && c->isConnected())
     hid = c->getService(NimBLEUUID("1812"));
-  }
-
-  char probeName[SEEN_NAME_LEN] = "";
+  char pn2[SEEN_NAME_LEN] = "";
   if (c->isConnected()) {
     NimBLERemoteService *gap = c->getService(NimBLEUUID("1800"));
     if (gap && c->isConnected()) {
@@ -875,298 +1344,329 @@ static void doAppleSecurityProbe(NimBLEClient *c, int seenIdx, int probeNum,
           gap->getCharacteristic(NimBLEUUID("2A00"));
       if (nm && nm->canRead() && c->isConnected()) {
         std::string gn = nm->readValue();
-        if (!gn.empty()) {
-          strncpy(probeName, gn.c_str(), sizeof(probeName) - 1);
-          probeName[sizeof(probeName) - 1] = '\0';
-        }
+        if (!gn.empty()) strncpy(pn2, gn.c_str(), sizeof(pn2) - 1);
       }
     }
   }
-
-  bool hidFound = (hid && c->isConnected());
-  const char *res = hidFound                           ? "HID!"
-                    : (pairingDone && !pairingSuccess) ? "pair fail"
-                    : (passkeyActive && !pairingDone)  ? "timeout"
-                                                       : "no HID";
-
-  if (logIdx >= 0) {
-    if (probeName[0])
-      snprintf(probeLog[logIdx], sizeof(probeLog[0]),
-               "APL %d/%d %s [%d] %s \"%s\"", probeNum, total,
-               dev.addr.toString().c_str() + 9, dev.rssi, res, probeName);
+  bool ok = (hid && c->isConnected());
+  const char *rs = ok                                 ? "HID!"
+                   : (pairingDone && !pairingSuccess) ? "pfail"
+                   : (passkeyActive && !pairingDone)  ? "tmout"
+                                                      : "noHID";
+  if (li >= 0) {
+    if (pn2[0])
+      snprintf(probeLog[li], sizeof(probeLog[0]), "%d/%d B(%s)[%d] %s \"%s\"",
+               pn, tot, d.mac_short, d.rssi, rs, pn2);
     else
-      snprintf(probeLog[logIdx], sizeof(probeLog[0]), "APL %d/%d %s [%d] %s",
-               probeNum, total, dev.addr.toString().c_str() + 9, dev.rssi, res);
-    needRedraw = true;
+      snprintf(probeLog[li], sizeof(probeLog[0]), "%d/%d B(%s)[%d] %s", pn, tot,
+               d.mac_short, d.rssi, rs);
   }
-
-  if (hidFound) {
-    bleAddr = dev.addr;
+  needRedraw = true;
+  if (ok) {
+    bleAddr = d.addr;
     bleFound = true;
     bleMatchReason = 5;
-    if (probeName[0]) {
-      strncpy(bleFoundName, probeName, sizeof(bleFoundName) - 1);
-      strncpy(dev.name, probeName, SEEN_NAME_LEN - 1);
-    } else
-      strncpy(bleFoundName, "(Apple HID)", sizeof(bleFoundName) - 1);
-    bleFoundName[sizeof(bleFoundName) - 1] = '\0';
+    strncpy(bleFoundName, pn2[0] ? pn2 : "(Apple HID)",
+            sizeof(bleFoundName) - 1);
     bleState = 2;
     needRedraw = true;
   }
 
-  waitDisconnect(c);
+  if (c->isConnected()) waitDisconn(c, 5000);
   passkeyActive = false;
+  pairingDone = false;
+  pairingSuccess = false;
+  vTaskDelay(pdMS_TO_TICKS(300));
 }
 
-// ===================== BLE TASK =====================
-void bleTask(void *) {
-  NimBLEDevice::init("CoreS3-KVM");
-  setKeyboardSecurityMode();
-
-  NimBLEScan *scan = NimBLEDevice::getScan();
-  scan->setScanCallbacks(&scanCbInstance, true);
-  scan->setActiveScan(true);
-  scan->setInterval(320);
-  scan->setWindow(160);
-
-  while (true) {
-    if (!bleFound) {
-      bleState = 1;
-      bleMatchReason = 0;
-      resetSeenDevs();
-      probeLogCount = 0;
-      probeTotalExpected = 0;
-      snprintf(bleStatusMsg, sizeof(bleStatusMsg), "scanning...");
+static bool bleDoConnect() {
+  bleState = 3;
+  char sm[12];
+  shortMac(bleAddr.toString().c_str(), sm, sizeof(sm));
+  strncpy(bleConnAddr, sm, sizeof(bleConnAddr));
+  snprintf(bleStatusMsg, sizeof(bleStatusMsg), "connect %s", sm);
+  needRedraw = true;
+  passkeyActive = false;
+  pairingDone = false;
+  pairingSuccess = false;
+  NimBLEClient *c = nullptr;
+  bool connected = false;
+  for (int att = 0; att < MAX_CONNECT_RETRIES && !connected; att++) {
+    if (att > 0) {
+      snprintf(bleStatusMsg, sizeof(bleStatusMsg), "retry %d/%d %s", att + 1,
+               MAX_CONNECT_RETRIES, sm);
       needRedraw = true;
-
-      // ====== PHASE 1: Passive scan ======
-      uint32_t budgetStart = millis();
-      while (!bleFound && (millis() - budgetStart < BLE_SCAN_BUDGET_MS)) {
-        bleScanDone = false;
-        if (!scan->start(0, false)) {
-          vTaskDelay(pdMS_TO_TICKS(500));
-          continue;
-        }
-        while (!bleScanDone && !bleFound &&
-               (millis() - budgetStart < BLE_SCAN_BUDGET_MS))
-          vTaskDelay(pdMS_TO_TICKS(50));
-        if (bleFound) break;
-        scan->stop();
-        vTaskDelay(pdMS_TO_TICKS(200));
-      }
-      scan->stop();
-      scanElapsedMs = millis() - budgetStart;
-
-      if (!bleFound) {
-        int sorted[SEEN_DEV_MAX];
-        int sortedN = getTopByRssi(sorted, SEEN_DEV_MAX);
-
-        int probeIdx[BLE_PROBE_MAX], probeCount = 0;
-        for (int s = 0; s < sortedN && probeCount < BLE_PROBE_MAX; s++) {
-          int i = sorted[s];
-          if (seenDevs[i].rssi < BLE_PROBE_MIN_RSSI ||
-              seenDevs[i].name[0] != '\0')
-            continue;
-          if (!seenDevs[i].isApple) probeIdx[probeCount++] = i;
-        }
-        int appleIdx[BLE_PROBE_MAX], appleCount = 0;
-        for (int s = 0; s < sortedN && appleCount < BLE_PROBE_MAX; s++) {
-          int i = sorted[s];
-          if (seenDevs[i].rssi < BLE_PROBE_MIN_RSSI ||
-              seenDevs[i].name[0] != '\0')
-            continue;
-          if (seenDevs[i].isApple) appleIdx[appleCount++] = i;
-        }
-
-        probeTotalExpected = probeCount + appleCount;
-        probeLogCount = 0;
-        Serial.printf("[BLE] Phase 2+3: %d non-Apple + %d Apple, heap=%d\n",
-                      probeCount, appleCount, esp_get_free_heap_size());
-
-        // ====== PHASE 2: non-Apple — ONE client for all ======
-        if (probeCount > 0 && !bleFound) {
-          setProbeSecurityMode();
-          NimBLEClient *pc = NimBLEDevice::createClient();
-          if (pc) {
-            pc->setConnectionParams(12, 24, 0, 200);
-            for (int p = 0; p < probeCount && !bleFound; p++) {
-              doQuickProbe(pc, probeIdx[p], p + 1, probeTotalExpected);
-              vTaskDelay(pdMS_TO_TICKS(400));
-            }
-            if (pc->isConnected()) waitDisconnect(pc);
-            NimBLEDevice::deleteClient(pc);
-            vTaskDelay(pdMS_TO_TICKS(300));
-            Serial.printf("[BLE] Phase 2 done, heap=%d\n",
-                          esp_get_free_heap_size());
-          }
-        }
-
-        // ====== PHASE 3: Apple — ONE client for all ======
-        if (appleCount > 0 && !bleFound) {
-          setKeyboardSecurityMode();
-          NimBLEClient *ac = NimBLEDevice::createClient();
-          if (ac) {
-            ac->setClientCallbacks(&secCb);
-            ac->setConnectionParams(6, 12, 0, 600);
-            for (int a = 0; a < appleCount && !bleFound; a++) {
-              doAppleSecurityProbe(ac, appleIdx[a], probeCount + a + 1,
-                                   probeTotalExpected);
-              vTaskDelay(pdMS_TO_TICKS(400));
-            }
-            if (ac->isConnected()) waitDisconnect(ac);
-            NimBLEDevice::deleteClient(ac);
-            vTaskDelay(pdMS_TO_TICKS(300));
-            Serial.printf("[BLE] Phase 3 done, heap=%d\n",
-                          esp_get_free_heap_size());
-          }
-        }
-
-        setKeyboardSecurityMode();
-      }
-
-      // ====== ALL DONE — idle if not found ======
-      if (!bleFound) {
-        bleState = 7;
-        snprintf(bleStatusMsg, sizeof(bleStatusMsg), "no kbd found");
-        needRedraw = true;
-        Serial.println("[BLE] idle mode (hold btn 2s = rescan)");
-        bleScanRequested = false;
-        while (!bleScanRequested) vTaskDelay(pdMS_TO_TICKS(500));
-        bleScanRequested = false;
-        continue;
-      }
-      needRedraw = true;
+      vTaskDelay(pdMS_TO_TICKS(1000 + att * 500));
     }
-
-    // ====== CONNECT ======
-    bleState = 3;
-    snprintf(bleStatusMsg, sizeof(bleStatusMsg), "connecting...");
-    needRedraw = true;
     passkeyActive = false;
     pairingDone = false;
     pairingSuccess = false;
-
-    NimBLEClient *c = nullptr;
-    bool connected = false;
-    for (int attempt = 0; attempt < MAX_CONNECT_RETRIES && !connected;
-         attempt++) {
-      if (attempt > 0) {
-        snprintf(bleStatusMsg, sizeof(bleStatusMsg), "retry %d/%d", attempt + 1,
-                 MAX_CONNECT_RETRIES);
-        needRedraw = true;
-        vTaskDelay(pdMS_TO_TICKS(1000 + attempt * 500));
-      }
-      passkeyActive = false;
-      pairingDone = false;
-      pairingSuccess = false;
-      c = NimBLEDevice::createClient();
-      if (!c) {
-        vTaskDelay(pdMS_TO_TICKS(500));
-        continue;
-      }
-      c->setClientCallbacks(&secCb);
-      c->setConnectionParams(6, 12, 0, 600);
-      if (c->connect(bleAddr)) {
-        connected = true;
-        break;
-      }
-      NimBLEDevice::deleteClient(c);
-      c = nullptr;
-    }
-
-    if (!connected) {
-      bleFound = false;
-      bleState = 0;
-      snprintf(bleStatusMsg, sizeof(bleStatusMsg), "connect failed");
-      needRedraw = true;
-      vTaskDelay(pdMS_TO_TICKS(2000));
+    c = NimBLEDevice::createClient();
+    if (!c) {
+      vTaskDelay(pdMS_TO_TICKS(500));
       continue;
     }
-
-    if (bleFoundName[0] == '\0' || bleFoundName[0] == '(') {
-      NimBLERemoteService *gap = c->getService(NimBLEUUID("1800"));
-      if (gap && c->isConnected()) {
-        NimBLERemoteCharacteristic *nm =
-            gap->getCharacteristic(NimBLEUUID("2A00"));
-        if (nm && nm->canRead() && c->isConnected()) {
-          std::string gn = nm->readValue();
-          if (!gn.empty()) {
-            strncpy(bleFoundName, gn.c_str(), sizeof(bleFoundName) - 1);
-            needRedraw = true;
-          }
+    c->setClientCallbacks(&secCb);
+    c->setConnectionParams(6, 12, 0, 600);
+    if (c->connect(bleAddr)) {
+      connected = true;
+      break;
+    }
+    NimBLEDevice::deleteClient(c);
+    c = nullptr;
+  }
+  if (!connected) {
+    bleState = 0;
+    snprintf(bleStatusMsg, sizeof(bleStatusMsg), "connect fail %s", sm);
+    needRedraw = true;
+    return false;
+  }
+  if (bleFoundName[0] == '\0' || bleFoundName[0] == '(') {
+    NimBLERemoteService *gap = c->getService(NimBLEUUID("1800"));
+    if (gap && c->isConnected()) {
+      NimBLERemoteCharacteristic *nm =
+          gap->getCharacteristic(NimBLEUUID("2A00"));
+      if (nm && nm->canRead() && c->isConnected()) {
+        std::string gn = nm->readValue();
+        if (!gn.empty()) {
+          strncpy(bleFoundName, gn.c_str(), sizeof(bleFoundName) - 1);
+          needRedraw = true;
         }
       }
     }
+  }
+  NimBLERemoteService *hid =
+      c->isConnected() ? c->getService(NimBLEUUID("1812")) : nullptr;
+  if (!hid && passkeyActive && !pairingDone && c->isConnected()) {
+    snprintf(bleStatusMsg, sizeof(bleStatusMsg), "enter PIN on kbd");
+    needRedraw = true;
+    uint32_t t0 = millis();
+    while (!pairingDone && c->isConnected() &&
+           (millis() - t0 < PASSKEY_DISPLAY_MS))
+      vTaskDelay(pdMS_TO_TICKS(100));
+  }
+  if (!hid && pairingDone && pairingSuccess && c->isConnected())
+    hid = c->getService(NimBLEUUID("1812"));
+  if (!hid || !c->isConnected()) {
+    if (c->isConnected()) c->disconnect();
+    vTaskDelay(pdMS_TO_TICKS(300));
+    NimBLEDevice::deleteClient(c);
+    passkeyActive = false;
+    bleState = 0;
+    snprintf(bleStatusMsg, sizeof(bleStatusMsg), "no HID svc");
+    needRedraw = true;
+    return false;
+  }
+  auto chars = hid->getCharacteristics(true);
+  int subs = 0;
+  for (auto &ch : chars)
+    if (ch->getUUID() == NimBLEUUID("2A4D") && ch->canNotify())
+      if (ch->subscribe(true, bleReportCb)) subs++;
+  knownKbdAddr = bleAddr;
+  knownKbdValid = true;
+  bleKbdConnected = true;
+  bleState = 4;
+  passkeyActive = false;
+  needRedraw = true;
+  while (c->isConnected()) vTaskDelay(pdMS_TO_TICKS(500));
+  bleKbdConnected = false;
+  bleState = 5;
+  snprintf(bleStatusMsg, sizeof(bleStatusMsg), "disconnected");
+  needRedraw = true;
+  NimBLEDevice::deleteClient(c);
+  bleFound = false;
+  return true;
+}
 
-    NimBLERemoteService *hid = nullptr;
-    if (c->isConnected()) hid = c->getService(NimBLEUUID("1812"));
-    if (!hid && passkeyActive && !pairingDone && c->isConnected()) {
-      snprintf(bleStatusMsg, sizeof(bleStatusMsg), "enter PIN on kbd");
-      needRedraw = true;
-      uint32_t t0 = millis();
-      while (!pairingDone && c->isConnected() &&
-             (millis() - t0 < PASSKEY_DISPLAY_MS))
-        vTaskDelay(pdMS_TO_TICKS(100));
+void bleTask(void *) {
+  NimBLEDevice::init("CoreS3-KVM");
+  setKbdSecMode();
+  NimBLEScan *scan = NimBLEDevice::getScan();
+  scan->setScanCallbacks(&scanCbInstance, true);
+  scan->setActiveScan(true);
+  scan->setInterval(200);
+  scan->setWindow(50);
+
+  while (true) {
+    if (USE_MAX_MODULE && maxDongleReady) {
+      classicScanDone = false;
+      classicScanRequest = true;
     }
-    if (!hid && pairingDone && pairingSuccess && c->isConnected())
-      hid = c->getService(NimBLEUUID("1812"));
 
-    if (!hid || !c->isConnected()) {
-      if (c->isConnected()) c->disconnect();
-      vTaskDelay(pdMS_TO_TICKS(300));
-      NimBLEDevice::deleteClient(c);
-      bleFound = false;
-      bleState = 0;
-      passkeyActive = false;
-      snprintf(bleStatusMsg, sizeof(bleStatusMsg), "no HID service");
-      needRedraw = true;
+    if (knownKbdValid && !bleKbdConnected) {
+      bleFound = true;
+      bleAddr = knownKbdAddr;
+      if (bleFoundName[0] == '\0')
+        strncpy(bleFoundName, "(reconnecting)", sizeof(bleFoundName) - 1);
+      bool wasConn = bleDoConnect();
+      if (wasConn) {
+        vTaskDelay(pdMS_TO_TICKS(1000));
+        continue;
+      }
+      knownKbdValid = false;
+      probesDone = true;
       vTaskDelay(pdMS_TO_TICKS(2000));
       continue;
     }
 
-    auto chars = hid->getCharacteristics(true);
-    int subscribed = 0;
-    for (auto &ch : chars)
-      if (ch->getUUID() == NimBLEUUID("2A4D") && ch->canNotify())
-        if (ch->subscribe(true, bleReportCb)) subscribed++;
+    if (probesDone) {
+      bleState = 7;
+      snprintf(bleStatusMsg, sizeof(bleStatusMsg), "mouse-only");
+      needRedraw = true;
+      while (!knownKbdValid) vTaskDelay(pdMS_TO_TICKS(1000));
+      continue;
+    }
 
-    bleKbdConnected = true;
-    bleState = 4;
-    passkeyActive = false;
-    needRedraw = true;
-    Serial.printf("[BLE] CONNECTED: %s (%d reports)\n", bleFoundName,
-                  subscribed);
-
-    while (c->isConnected()) vTaskDelay(pdMS_TO_TICKS(500));
-
-    bleKbdConnected = false;
-    bleState = 5;
-    snprintf(bleStatusMsg, sizeof(bleStatusMsg), "disconnected");
-    needRedraw = true;
-    NimBLEDevice::deleteClient(c);
+    bleState = 1;
+    bleMatchReason = 0;
     bleFound = false;
-    vTaskDelay(pdMS_TO_TICKS(1000));
+    bleFoundName[0] = '\0';
+    bleConnAddr[0] = '\0';
+    resetSeenDevs();
+    probeLogCount = 0;
+    probeTotalExpected = 0;
+    snprintf(bleStatusMsg, sizeof(bleStatusMsg), "scanning...");
+    needRedraw = true;
+
+    if (maxDongleReady) {
+      classicScanDone = false;
+      classicScanRequest = true;
+    }
+
+    // scan bursts with WiFi gaps
+    uint32_t budgetStart = millis();
+    while (!bleFound && (millis() - budgetStart < BLE_SCAN_BUDGET_MS)) {
+      bleScanDone = false;
+      if (!scan->start(0, false)) {
+        vTaskDelay(pdMS_TO_TICKS(500));
+        continue;
+      }
+      uint32_t burstEnd = millis() + BLE_SCAN_BURST_MS;
+      while (!bleScanDone && !bleFound && millis() < burstEnd &&
+             (millis() - budgetStart < BLE_SCAN_BUDGET_MS))
+        vTaskDelay(pdMS_TO_TICKS(50));
+      scan->stop();
+      if (bleFound) break;
+      // WiFi-only gap
+      vTaskDelay(pdMS_TO_TICKS(BLE_SCAN_GAP_MS));
+    }
+    scan->stop();
+
+    if (classicScanRequest && !classicScanDone) {
+#if USE_MAX_MODULE
+      if (maxDongleReady) mxHciCmd(0x0402, NULL, 0);
+#endif
+      uint32_t w0 = millis();
+      while (!classicScanDone && millis() - w0 < 3000)
+        vTaskDelay(pdMS_TO_TICKS(100));
+    }
+    classicScanRequest = false;
+
+    if (bleFound) {
+      setKbdSecMode();
+      bool ok = bleDoConnect();
+      if (!ok && !knownKbdValid) {
+        bleFound = false;
+        probesDone = true;
+      }
+      if (!knownKbdValid) vTaskDelay(pdMS_TO_TICKS(2000));
+      continue;
+    }
+
+    // ============ PROBING: single list sorted by RSSI ============
+    int sorted[SEEN_DEV_MAX], sortedN = getTopByRssi(sorted, SEEN_DEV_MAX);
+    int probeList[BLE_PROBE_MAX], probeCnt = 0;
+
+    for (int s = 0; s < sortedN && probeCnt < BLE_PROBE_MAX; s++) {
+      int i = sorted[s];
+      if (seenDevs[i].rssi < BLE_PROBE_MIN_RSSI) continue;
+      if (seenDevs[i].name[0]) continue;
+      probeList[probeCnt++] = i;
+    }
+
+    probeTotalExpected = probeCnt;
+    probeLogCount = 0;
+
+    if (probeCnt > 0 && !bleFound) {
+      strncpy(rtcDbg, "probe-start", sizeof(rtcDbg));  
+      if (!pc) {
+        pc = NimBLEDevice::createClient();
+        if (pc) pc->setClientCallbacks(&secCb);
+      }
+      if (pc) {
+        for (int p = 0; p < probeCnt && !bleFound; p++) {
+          int si = probeList[p];
+          if (si < 0 || si >= SEEN_DEV_MAX || !seenDevs[si].used) continue;
+
+          bool apple = seenDevs[si].isApple;
+
+          // switch global sec-mode BEFORE this connection
+          if (apple) {
+            strncpy(rtcDbg, "apple-probe", sizeof(rtcDbg));
+            setKbdSecMode();
+            pc->setConnectionParams(6, 12, 0, 600);
+            doAppleProbe(pc, si, p + 1, probeCnt);
+          } else {
+            strncpy(rtcDbg, "ble-probe", sizeof(rtcDbg));
+            setProbeSecMode();
+            pc->setConnectionParams(12, 24, 0, 200);
+            doProbe(pc, si, p + 1, probeCnt);
+          }
+
+          // make sure fully disconnected before next
+          if (pc->isConnected()) waitDisconn(pc, 3000);
+          vTaskDelay(pdMS_TO_TICKS(apple ? 1000 : 600));
+        }
+
+        if (pc->isConnected()) waitDisconn(pc, 3000);
+        strncpy(rtcDbg, "probe-cleanup", sizeof(rtcDbg));
+        passkeyActive = false;
+        pairingDone = false;
+        pairingSuccess = false;
+        needRedraw = true;
+        vTaskDelay(pdMS_TO_TICKS(300));
+      }
+    }
+
+    strncpy(rtcDbg, "pre-setKbdSec", sizeof(rtcDbg));
+    vTaskDelay(pdMS_TO_TICKS(200));
+    setKbdSecMode();
+    strncpy(rtcDbg, "post-setKbdSec", sizeof(rtcDbg));
+
+    if (bleFound) {
+      strncpy(rtcDbg, "final-connect", sizeof(rtcDbg));
+      bool ok = bleDoConnect();
+      if (!ok && !knownKbdValid) {
+        bleFound = false;
+        probesDone = true;
+      }
+      if (!knownKbdValid) vTaskDelay(pdMS_TO_TICKS(2000));
+      continue;
+    }
+
+    strncpy(rtcDbg, "pre-mouseOnly", sizeof(rtcDbg));
+    probesDone = true;
   }
 }
 
 // ===================== DISPLAY =====================
-static const char *matchReasonStr(int r) {
+static const char *matchStr(int r) {
   switch (r) {
     case 1:
-      return "adv name";
+      return "name";
     case 2:
-      return "adv HID";
+      return "HID";
     case 3:
-      return "probe name";
+      return "pName";
     case 4:
-      return "probe HID";
+      return "pHID";
     case 5:
       return "Apple";
     default:
       return "";
   }
 }
-static void drawPasskeyScreen() {
+static void drawPasskey() {
   M5.Display.startWrite();
   M5.Display.fillScreen(0x0010);
   M5.Display.setTextSize(2);
@@ -1180,13 +1680,14 @@ static void drawPasskeyScreen() {
   M5.Display.setTextColor(GREEN);
   char buf[12];
   snprintf(buf, sizeof(buf), "%06d", (int)passkeyValue);
-  M5.Display.setCursor((320 - 180) / 2, 110);
+  M5.Display.setCursor(70, 110);
   M5.Display.print(buf);
   M5.Display.setTextSize(2);
   M5.Display.setCursor(20, 180);
-  if (pairingDone) {
-    M5.Display.setTextColor(pairingSuccess ? GREEN : RED);
-    M5.Display.print(pairingSuccess ? "Paired OK!" : "FAILED");
+  bool pd = pairingDone, ps = pairingSuccess;
+  if (pd) {
+    M5.Display.setTextColor(ps ? GREEN : RED);
+    M5.Display.print(ps ? "Paired OK!" : "FAILED");
   } else {
     M5.Display.setTextColor(WHITE);
     M5.Display.printf("Waiting... %ds", (millis() - passkeyShownMs) / 1000);
@@ -1199,35 +1700,53 @@ static void drawPasskeyScreen() {
   }
   M5.Display.endWrite();
 }
+
+struct scan_disp_entry_t {
+  char mac[12];
+  int rssi;
+  uint8_t flags;
+};
+
 static void drawUI() {
   if (passkeyActive) {
-    drawPasskeyScreen();
+    drawPasskey();
     return;
   }
+  int cBS = bleState, cMR = bleMatchReason, cSC = seenDevCount,
+      cPLC = probeLogCount, cPT = probeTotalExpected;
+  bool cUR = usbMouseReady, cMP = maxPresent, cMR2 = maxDongleReady;
+
   M5.Display.startWrite();
   M5.Display.fillScreen(BLACK);
-  M5.Display.setTextSize(2);
-  M5.Display.setCursor(10, 5);
+  M5.Display.setTextSize(3);
+  M5.Display.setCursor(10, 4);
   M5.Display.setTextColor(WHITE);
   M5.Display.print("PC ");
   M5.Display.setTextColor(activeTarget == 0 ? GREEN : CYAN);
   M5.Display.print(activeTarget + 1);
-  M5.Display.setCursor(120, 5);
-  M5.Display.setTextColor(usbMouseReady ? GREEN : RED);
-  M5.Display.printf("Mouse:%s", usbMouseReady ? "OK" : "--");
-  M5.Display.setCursor(10, 30);
-  switch (bleState) {
+  M5.Display.setTextSize(2);
+  M5.Display.setCursor(10, 36);
+  M5.Display.setTextColor(cUR ? GREEN : RED);
+  M5.Display.printf("M: %s", cUR ? "OK" : "--");
+  if (cMP) {
+    M5.Display.setCursor(150, 36);
+    M5.Display.setTextColor(cMR2 ? CYAN : YELLOW);
+    M5.Display.printf("BT: %s", cMR2 ? "OK" : "..");
+  }
+
+  M5.Display.setCursor(10, 60);
+  switch (cBS) {
     case 0:
       M5.Display.setTextColor(RED);
       M5.Display.printf("K: %s", bleStatusMsg);
       break;
     case 1:
       M5.Display.setTextColor(YELLOW);
-      M5.Display.printf("K: scan %d dev", seenDevCount);
+      M5.Display.printf("K: scan %d dev", cSC);
       break;
     case 2:
       M5.Display.setTextColor(GREEN);
-      M5.Display.printf("K: FOUND (%s)", matchReasonStr(bleMatchReason));
+      M5.Display.printf("K: FOUND (%s)", matchStr(cMR));
       break;
     case 3:
       M5.Display.setTextColor(YELLOW);
@@ -1247,87 +1766,130 @@ static void drawUI() {
       break;
     case 7:
       M5.Display.setTextColor(0x7BEF);
-      M5.Display.print("K: no kbd found");
+      M5.Display.print("K: mouse-only");
       break;
   }
-  if (bleFoundName[0]) {
-    M5.Display.setCursor(10, 52);
-    M5.Display.setTextColor(GREEN);
-    M5.Display.setTextSize(1);
-    M5.Display.printf(">> %s", bleFoundName);
-  }
+
+  int yBase = 82;
   M5.Display.setTextSize(1);
-  int y = 68;
-  if (bleState == 1) {
-    int top[TOP_DISPLAY];
-    int topN = getTopByRssi(top, TOP_DISPLAY);
-    for (int t = 0; t < topN && y < 230; t++) {
-      int i = top[t];
-      M5.Display.setCursor(5, y);
-      if (seenDevs[i].name[0]) {
-        M5.Display.setTextColor(WHITE);
-        M5.Display.printf("%d: %s [%d]%s%s", t + 1, seenDevs[i].name,
-                          seenDevs[i].rssi,
-                          seenDevs[i].hasHidUuid ? " HID" : "",
-                          seenDevs[i].isApple ? " APL" : "");
-      } else {
-        M5.Display.setTextColor(seenDevs[i].isApple ? YELLOW
-                                                    : (uint16_t)0x7BEF);
-        M5.Display.printf("%d: (%s) [%d]%s%s", t + 1,
-                          seenDevs[i].addr.toString().c_str(), seenDevs[i].rssi,
-                          seenDevs[i].hasHidUuid ? " HID" : "",
-                          seenDevs[i].isApple ? " APL" : "");
+  if (bleFoundName[0] && bleFoundName[0] != '(') {
+    M5.Display.setCursor(10, yBase);
+    M5.Display.setTextColor(GREEN);
+    M5.Display.printf(">> %s", bleFoundName);
+    yBase += 12;
+  } else if (bleConnAddr[0] && (cBS == 3 || cBS == 5)) {
+    M5.Display.setCursor(10, yBase);
+    M5.Display.setTextColor(YELLOW);
+    M5.Display.printf(">> %s", bleConnAddr);
+    yBase += 12;
+  }
+
+  int y = yBase + 2;
+
+  if (cBS == 1) {
+    scan_disp_entry_t dd[TOP_DISPLAY];
+    int ddN = 0, ddTotal = 0;
+    xSemaphoreTake(seenMutex, portMAX_DELAY);
+    {
+      int all[SEEN_DEV_MAX], n = 0;
+      for (int i = 0; i < seenDevCount && i < SEEN_DEV_MAX; i++)
+        if (seenDevs[i].used) all[n++] = i;
+      for (int a = 0; a < n - 1; a++)
+        for (int b = a + 1; b < n; b++)
+          if (seenDevs[all[b]].rssi > seenDevs[all[a]].rssi) {
+            int t = all[a];
+            all[a] = all[b];
+            all[b] = t;
+          }
+      ddN = (n < TOP_DISPLAY) ? n : TOP_DISPLAY;
+      for (int t = 0; t < ddN; t++) {
+        int i = all[t];
+        memcpy(dd[t].mac, seenDevs[i].mac_short, sizeof(dd[t].mac));
+        dd[t].rssi = seenDevs[i].rssi;
+        dd[t].flags = (seenDevs[i].name[0] ? 0x01 : 0) |
+                      (seenDevs[i].hasHidUuid ? 0x02 : 0) |
+                      (seenDevs[i].isApple ? 0x04 : 0) |
+                      (seenDevs[i].isClassic ? 0x08 : 0);
       }
-      y += 12;
+      ddTotal = seenDevCount;
     }
-    if (seenDevCount > TOP_DISPLAY) {
-      M5.Display.setCursor(5, y);
+    xSemaphoreGive(seenMutex);
+    for (int t = 0; t < ddN; t++) {
+      int col = t / SCAN_COL_ROWS, row = t % SCAN_COL_ROWS;
+      int xP = col == 0 ? 10 : 168, yP = y + row * 11;
+      if (yP > 228) break;
+      M5.Display.setCursor(xP, yP);
+      if (dd[t].flags & 0x01)
+        M5.Display.setTextColor(WHITE);
+      else if (dd[t].flags & 0x02)
+        M5.Display.setTextColor(GREEN);
+      else if (dd[t].flags & 0x04)
+        M5.Display.setTextColor(YELLOW);
+      else if (dd[t].flags & 0x08)
+        M5.Display.setTextColor(CYAN);
+      else
+        M5.Display.setTextColor(0x7BEF);
+      M5.Display.printf("%d:%c(%s)[%d]", t + 1,
+                        (dd[t].flags & 0x08) ? 'C' : 'B', dd[t].mac,
+                        dd[t].rssi);
+    }
+    if (ddTotal > TOP_DISPLAY) {
+      M5.Display.setCursor(10, y + SCAN_COL_ROWS * 11);
       M5.Display.setTextColor(DARKGREY);
-      M5.Display.printf("+%d more", seenDevCount - TOP_DISPLAY);
+      M5.Display.printf("+%d more", ddTotal - TOP_DISPLAY);
     }
-  } else if (bleState == 6) {
-    M5.Display.setCursor(5, y);
+  } else if (cBS == 6) {
+    M5.Display.setCursor(10, y);
     M5.Display.setTextColor(CYAN);
-    M5.Display.printf("Probing %d devices...", probeTotalExpected);
+    M5.Display.printf("Probing %d of %d devices", cPT, cSC);
     y += 14;
-    for (int i = 0; i < probeLogCount && y < 230; i++) {
-      M5.Display.setCursor(5, y);
+    for (int i = 0; i < cPLC && y < 230; i++) {
+      M5.Display.setCursor(10, y);
       if (strstr(probeLog[i], "HID!"))
         M5.Display.setTextColor(GREEN);
-      else if (strstr(probeLog[i], "no HID") || strstr(probeLog[i], "fail") ||
-               strstr(probeLog[i], "no conn") ||
-               strstr(probeLog[i], "timeout") ||
-               strstr(probeLog[i], "pair fail"))
+      else if (strstr(probeLog[i], "noHID") || strstr(probeLog[i], "fail") ||
+               strstr(probeLog[i], "no conn") || strstr(probeLog[i], "tmout") ||
+               strstr(probeLog[i], "pfail"))
         M5.Display.setTextColor(0xFB20);
-      else if (strstr(probeLog[i], "pairing"))
+      else if (strstr(probeLog[i], "pair"))
         M5.Display.setTextColor(CYAN);
       else
         M5.Display.setTextColor(YELLOW);
       M5.Display.print(probeLog[i]);
       y += 12;
     }
-  } else if (bleState == 7) {
-    M5.Display.setCursor(5, y);
+  } else if (cBS == 7) {
+    M5.Display.setCursor(10, y);
     M5.Display.setTextColor(WHITE);
     M5.Display.print("Working as mouse-only KVM");
     y += 14;
-    M5.Display.setCursor(5, y);
-    M5.Display.setTextColor(YELLOW);
-    M5.Display.print("Hold button 2s = rescan BLE");
-    y += 18;
-    if (probeLogCount > 0) {
-      M5.Display.setCursor(5, y);
+    if (cPLC > 0) {
+      M5.Display.setCursor(10, y);
       M5.Display.setTextColor(DARKGREY);
-      M5.Display.print("Last probe results:");
+      M5.Display.print("Last results:");
       y += 12;
-      for (int i = 0; i < probeLogCount && y < 230; i++) {
-        M5.Display.setCursor(5, y);
+      for (int i = 0; i < cPLC && y < 230; i++) {
+        M5.Display.setCursor(10, y);
         M5.Display.setTextColor(DARKGREY);
         M5.Display.print(probeLog[i]);
         y += 12;
       }
     }
   }
+
+  M5.Display.setCursor(10, 230);
+  M5.Display.setTextSize(1);
+  M5.Display.setTextColor(DARKGREY);
+  M5.Display.printf("stk:%d idle:%d heap:%d",
+    uxTaskGetStackHighWaterMark(NULL),
+    idleLevel(),
+    esp_get_free_heap_size() / 1024);
+
+  M5.Display.setCursor(10, 220);
+  M5.Display.setTextSize(1);
+  M5.Display.setTextColor(wasReboot ? RED : DARKGREY);
+  M5.Display.printf("%s%s", wasReboot ? "!" : "", rtcDbg);
+
   M5.Display.endWrite();
 }
 
@@ -1341,15 +1903,31 @@ void setup() {
   delay(100);
   M5.Display.setRotation(1);
   M5.Display.fillScreen(BLACK);
-  M5.Display.setTextColor(WHITE);
   M5.Display.setTextSize(2);
   M5.Display.setCursor(10, 10);
   M5.Display.println("KVM Init...");
+
+  if (rtcDbg[0] >= 0x20 && rtcDbg[0] < 0x7F) {
+    wasReboot = true;
+    M5.Display.setTextSize(1);
+    M5.Display.setCursor(10, 40);
+    M5.Display.setTextColor(RED);
+    M5.Display.printf("PREV CRASH: %s", rtcDbg);
+    delay(5000);
+  }
+  strncpy(rtcDbg, "setup-ok", sizeof(rtcDbg));
+
+  seenMutex = xSemaphoreCreateMutex();
+#if USE_MAX_MODULE
+  spiMutex = xSemaphoreCreateMutex();
+#endif
   mouseQueue = xQueueCreate(128, sizeof(mouse_evt_t));
   kbdQueue = xQueueCreate(32, sizeof(kbd_evt_t));
+
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   esp_wifi_set_channel(ESPNOW_CHAN, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_ps(WIFI_PS_NONE);
   esp_now_init();
   esp_now_register_send_cb(onEspNowSendDone);
   memcpy(peer1.peer_addr, ATOM_MAC_1, 6);
@@ -1364,100 +1942,81 @@ void setup() {
   esp_now_add_peer(&peer2);
   sendCmd(ATOM_MAC_1, PKT_ACTIVATE);
   sendCmd(ATOM_MAC_2, PKT_DEACTIVATE);
+
   xTaskCreatePinnedToCore(usbHostTask, "USB", 8192, NULL, 5, NULL, 1);
-  xTaskCreatePinnedToCore(bleTask, "BLE", 64 * 1024, NULL, 3, NULL, 0);
+  xTaskCreatePinnedToCore(mouseSendTask, "MOUSE", 4096, NULL, 6, NULL, 1);
+
+#if WITH_KEYBOARD
+  xTaskCreatePinnedToCore(bleTask, "BLE", 64 * 1024, NULL, 1, NULL, 0);
+#if USE_MAX_MODULE
+  xTaskCreatePinnedToCore(max3421Task, "MAX", 8192, NULL, 1, NULL, 1);
+#endif
+#endif
+
   delay(300);
+  lastActivityMs = millis();
   drawUI();
 }
 
 // ===================== LOOP =====================
 static uint32_t lastBeat = 0;
-static bool prevUsb = false, prevBle = false, prevPasskey = false;
+static bool prevUsb = false, prevBle = false, prevPk = false;
 static int prevBleS = -1;
-static uint8_t prevButtons = 0;
-static uint32_t btnDownStart = 0;
-static bool btnLongHandled = false;
 
 void loop() {
   M5.update();
 
-  // button: short=switch, long 2s=rescan
-  if (M5.BtnA.isPressed()) {
-    if (btnDownStart == 0) btnDownStart = millis();
-    if (!btnLongHandled && (millis() - btnDownStart > 2000)) {
-      btnLongHandled = true;
-      bleScanRequested = true;
-      needRedraw = true;
-    }
-  } else {
-    if (btnDownStart > 0 && !btnLongHandled)
-      if (millis() - lastSwitchMs > SWITCH_DEBOUNCE_MS) switchTarget();
-    btnDownStart = 0;
-    btnLongHandled = false;
-  }
-
-  mouse_evt_t m;
-  while (xQueueReceive(mouseQueue, &m, 0) == pdTRUE) {
-    bool m4 = (m.buttons & 0x08);
-    if (m4 && !mouse4Held && (millis() - lastSwitchMs > SWITCH_DEBOUNCE_MS))
-      switchTarget();
-    mouse4Held = m4;
-    uint8_t btns3 = m.buttons & 0x07;
-    bool btnChanged = (btns3 != prevButtons);
-    mAccum.buttons = m.buttons;
-    mAccum.x += m.x;
-    mAccum.y += m.y;
-    mAccum.wheel += m.wheel;
-    mDirty = true;
-    if (btnChanged) {
-      txMouse(&mAccum);
-      prevButtons = btns3;
-      mAccum = {};
-      mAccum.buttons = m.buttons;
-      mDirty = false;
-      mLastSendUs = micros();
-    }
-  }
-  if (mDirty) {
-    uint32_t now = micros();
-    if (now - mLastSendUs >= MOUSE_SEND_US) {
-      txMouse(&mAccum);
-      mAccum = {};
-      mDirty = false;
-      mLastSendUs = now;
-    }
+  if ((M5.BtnA.wasPressed() || switchRequest) &&
+      millis() - lastSwitchMs > SWITCH_DEBOUNCE_MS) {
+    lastActivityMs = millis();
+    switchRequest = false;
+    switchTarget();
   }
 
   kbd_evt_t k;
   while (xQueueReceive(kbdQueue, &k, 0) == pdTRUE) txKbd(&k);
 
-  if (millis() - lastBeat > HEARTBEAT_MS) {
+  uint32_t hbInterval;
+  int loopDelay;
+  switch (idleLevel()) {
+    case 2:  hbInterval = IDLE2_HEARTBEAT_MS; loopDelay = IDLE2_LOOP_MS; break;
+    case 1:  hbInterval = IDLE1_HEARTBEAT_MS; loopDelay = IDLE1_LOOP_MS; break;
+    default: hbInterval = HEARTBEAT_MS;       loopDelay = 1;             break;
+  }
+
+  if (millis() - lastBeat > hbInterval) {
     sendCmd(activeMac(), PKT_ACTIVATE);
-    delay(2);
     sendCmd(inactiveMac(), PKT_DEACTIVATE);
     lastBeat = millis();
   }
 
+  bool cU = usbMouseReady, cB = bleKbdConnected, cP = passkeyActive;
+  int cS = bleState;
   bool force = false;
-  if (passkeyActive) {
+  if (cP) {
     static uint32_t lp = 0;
     if (millis() - lp > 1000) {
       force = true;
       lp = millis();
     }
   }
-  if (force || needRedraw || usbMouseReady != prevUsb ||
-      bleKbdConnected != prevBle || bleState != prevBleS ||
-      passkeyActive != prevPasskey) {
-    prevUsb = usbMouseReady;
-    prevBle = bleKbdConnected;
-    prevBleS = bleState;
-    prevPasskey = passkeyActive;
+  if (force || needRedraw || cU != prevUsb || cB != prevBle || cS != prevBleS ||
+      cP != prevPk) {
+    prevUsb = cU;
+    prevBle = cB;
+    prevBleS = cS;
+    prevPk = cP;
     needRedraw = false;
     drawUI();
   }
-  delay(1);
+
+  delay(loopDelay);
 }
 ```
 
-- Click reset button once (DO NOT HOLD) on M5Stack CoreS3 se and you'll see new screen. Now plug-in mouse dongle and connect keyboard via bluetooth (Pairing starts automatically as soon as you enable the device). Don't forget to click forget in macos settings if you already connected keyboard to macos via bluetooth. Sometimes keyboard might ask you to input security code on it which will be displayed on device screen.
+- Click reset button once (DO NOT HOLD) on M5Stack CoreS3 se and you'll see new screen. Now plug-in mouse dongle and connect keyboard via bluetooth (Pairing starts automatically as soon as you enable the device). Don't forget to click "Forget" in macos settings if you already connected keyboard to macos via bluetooth.
+
+Known issues: 
+- Mouse can be laggy during keyboard lookup process (once it finishes, everything goes back to normal) (Device has only 1 radio module so it's impossible to fix)
+- Sometimes keyboard might ask you to input security code on it which will be displayed on device screen
+- Config has inactivity time of 5 minutes (light idle) (15min = deep idle) - if you don't use keyboard/mouse during this time - it goes into semi-sleep mode where it does not read input 1000times per second and starts working more efficiently until you start using devices again (first movement might be delayed because of this)
