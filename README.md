@@ -164,8 +164,11 @@ void tud_connect(void);
 
 // ── Watchdog thresholds ──
 #define BOOT_GRACE_MS 5000      // USB enumeration grace period after boot
-#define ESPNOW_TIMEOUT_MS 3000  // no packets from CoreS3 → restart
+#define ESPNOW_TIMEOUT_MS 3400  // no packets from CoreS3 → restart
 #define USB_STUCK_MS 4000       // USB unhealthy while active → restart
+
+static uint32_t usbGoneSinceMs = 0;
+#define USB_GONE_REPLUG_MS 30000
 
 USBHIDKeyboard UsbKbd;
 USBHIDMouse UsbMouse;
@@ -200,7 +203,6 @@ static uint8_t prevBtn = 0;
 // ── Health state ──
 static uint32_t bootMs = 0;
 volatile uint32_t lastPacketMs = 0;
-static uint32_t usbBadSinceMs = 0;
 
 void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (len < 1) return;
@@ -339,53 +341,65 @@ void setup() {
   lastPacketMs = millis();
   xTaskCreatePinnedToCore(usbTask, "USB", 4096, NULL, 10, NULL, 1);
 }
-
-static uint32_t usbReplugCount = 0;
-#define MAX_REPLUG_ATTEMPTS 2
-
-void forceUsbReplug() {
-    deviceActive = false;
-    pendingActivate = false;
-    pendingDeactivate = false;
-    vTaskDelay(50);
-
-    tud_disconnect();
-    vTaskDelay(1000);
-    tud_connect();
-
-    usbBadSinceMs = 0;
-    usbReplugCount++;
-}
-
 void loop() {
-    uint32_t now = millis();
-    bool grace = (now - bootMs) < BOOT_GRACE_MS;
+  uint32_t now = millis();
+  bool grace = (now - bootMs) < BOOT_GRACE_MS;
 
-    if (!grace && (now - lastPacketMs > ESPNOW_TIMEOUT_MS)) {
-        ESP.restart();
+  bool mounted = tud_mounted();
+  bool suspended = tud_suspended();
+
+  // ── USB host gone (port powered off) ──
+  if (!mounted && !suspended && !grace) {
+    if (deviceActive) {
+      deviceActive = false;
+      xQueueReset(mouseQ);
+      xQueueReset(kbdQ);
+    }
+    lastPacketMs = now;
+
+    if (usbGoneSinceMs == 0) {
+      usbGoneSinceMs = now;
+    } else if (now - usbGoneSinceMs > USB_GONE_REPLUG_MS) {
+      tud_disconnect();
+      vTaskDelay(pdMS_TO_TICKS(1000));
+      tud_connect();
+      usbGoneSinceMs = now;
     }
 
-    if (!grace) {
-        bool mounted = tud_mounted(); 
-        bool suspended = tud_suspended();
+    delay(500);
+    return;
+  }
 
-        if (!mounted && !suspended) {
-            if (usbBadSinceMs == 0) {
-                usbBadSinceMs = now;
-            } else if (now - usbBadSinceMs > USB_STUCK_MS) {
-                if (usbReplugCount < MAX_REPLUG_ATTEMPTS) {
-                    forceUsbReplug(); 
-                } else {
-                    ESP.restart(); 
-                }
-            }
-        } else {
-            usbBadSinceMs = 0;
-            usbReplugCount = 0; 
-        }
+  // ── USB host suspended (Mac sleeping) ──
+  if (suspended) {
+    if (deviceActive) {
+      deviceActive = false;
+      xQueueReset(mouseQ);
+      xQueueReset(kbdQ);
     }
+    lastPacketMs = now;
+    usbGoneSinceMs = 0;
+    delay(500);
+    return;
+  }
 
-    delay(100);
+  // ── Normal operation: mounted == true ──
+  usbGoneSinceMs = 0;
+
+  if (!grace && (now - lastPacketMs > ESPNOW_TIMEOUT_MS)) {
+    deviceActive = false;
+    xQueueReset(mouseQ);
+    xQueueReset(kbdQ);
+
+    esp_now_deinit();
+    esp_wifi_set_channel(ESPNOW_CHAN, WIFI_SECOND_CHAN_NONE);
+    if (esp_now_init() == ESP_OK) {
+      esp_now_register_recv_cb(onRecv);
+    }
+    lastPacketMs = now;
+  }
+
+  delay(100);
 }
 ```
 
