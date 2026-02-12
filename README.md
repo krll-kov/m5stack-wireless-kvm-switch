@@ -10,12 +10,12 @@ Switch between two PCs with a single mouse button press. No cables for periphera
 
 | Component | Qty |
 |---|:-:|
-| [M5Stack CoreS3 SE](https://shop.m5stack.com/) IoT Controller (without Battery Bottom) | 1 |
-| [AtomS3U](https://shop.m5stack.com/) ESP32S3 Dev Kit with USB-A | 2 |
-| M5GO Battery Bottom3 (for CoreS3 only) | 1 |
-| M5GO / FIRE Battery Bottom Charging Base | 1 |
-| M5Stack USB Module V1.2 — for M5Core *(legacy BT only)* | 1 |
-| Bluetooth 4.0 USB Module *(legacy BT only)* | 1 |
+| [M5Stack CoreS3 SE IoT Controller](https://shop.m5stack.com/products/m5stack-cores3-se-iot-controller-w-o-battery-bottom) (without Battery Bottom) | 1 |
+| [AtomS3U](https://shop.m5stack.com/products/atoms3u) ESP32S3 Dev Kit with USB-A | 2 |
+| [M5GO Battery Bottom3](https://shop.m5stack.com/products/m5go-battery-bottom3-for-cores3-only) (for CoreS3 only) | 1 |
+| [M5GO / FIRE Battery Bottom](https://shop.m5stack.com/products/battery-bottom-charging-base) Charging Base | 1 |
+| [M5Stack USB Module V1.2 — for M5Core](https://shop.m5stack.com/products/usb-module-with-max3421e-v1-2?variant=44512358793473) *(For legacy BT only)* | 1 |
+| [Bluetooth 4.0 USB Module](https://botland.store/usb-bluetooth-adapters/3561-bluetooth-40-to-usb-module-6959420908691.html) *(For legacy BT only)* | 1 |
 | M3×25 DIN 912 A2 screws | 2 |
 | M3×22 DIN 912 A2 screws | 2 |
 
