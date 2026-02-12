@@ -150,6 +150,8 @@ extern "C" {
 bool tud_mounted(void);
 bool tud_suspended(void);
 bool tud_remote_wakeup(void);
+void tud_disconnect(void);
+void tud_connect(void);
 }
 
 #define ESPNOW_CHAN 1
@@ -162,9 +164,8 @@ bool tud_remote_wakeup(void);
 
 // ── Watchdog thresholds ──
 #define BOOT_GRACE_MS 5000      // USB enumeration grace period after boot
-#define ESPNOW_TIMEOUT_MS 1500  // no packets from CoreS3 → restart
+#define ESPNOW_TIMEOUT_MS 3000  // no packets from CoreS3 → restart
 #define USB_STUCK_MS 4000       // USB unhealthy while active → restart
-#define USB_WAKEUP_EVERY 2000   // remote-wakeup attempt interval
 
 USBHIDKeyboard UsbKbd;
 USBHIDMouse UsbMouse;
@@ -200,7 +201,6 @@ static uint8_t prevBtn = 0;
 static uint32_t bootMs = 0;
 volatile uint32_t lastPacketMs = 0;
 static uint32_t usbBadSinceMs = 0;
-static uint32_t lastWakeupMs = 0;
 
 void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (len < 1) return;
@@ -236,6 +236,15 @@ void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   }
 }
 
+static inline bool ensureUsbAwake() {
+    if (tud_suspended()) {
+        tud_remote_wakeup();
+        vTaskDelay(pdMS_TO_TICKS(20));
+        return tud_mounted() && !tud_suspended();
+    }
+    return tud_mounted();
+}
+
 void usbTask(void *pvParameters) {
   MousePkt p;
   KbdPkt k;
@@ -264,6 +273,7 @@ void usbTask(void *pvParameters) {
     }
 
     while (deviceActive && xQueueReceive(mouseQ, &p, 0) == pdTRUE) {
+      if (!ensureUsbAwake()) break;
       int16_t rx = p.dx;
       int16_t ry = p.dy;
       int8_t rw = p.whl;
@@ -289,6 +299,7 @@ void usbTask(void *pvParameters) {
     }
 
     while (deviceActive && xQueueReceive(kbdQ, &k, 0) == pdTRUE) {
+      if (!ensureUsbAwake()) break;
       KeyReport rpt;
       rpt.modifiers = k.mod;
       rpt.reserved = 0;
@@ -297,7 +308,7 @@ void usbTask(void *pvParameters) {
     }
 
     if (!deviceActive) {
-      vTaskDelay(10);
+      vTaskDelay(100);
       xQueueReset(mouseQ);
       xQueueReset(kbdQ);
     } else {
@@ -311,6 +322,7 @@ void setup() {
 
   UsbMouse.begin();
   UsbKbd.begin();
+  USB.usbAttributes(0xA0);
   USB.begin();
 
   mouseQ = xQueueCreate(128, sizeof(MousePkt));
@@ -328,28 +340,52 @@ void setup() {
   xTaskCreatePinnedToCore(usbTask, "USB", 4096, NULL, 10, NULL, 1);
 }
 
-void loop() {
-  uint32_t now = millis();
-  bool grace = (now - bootMs) < BOOT_GRACE_MS;
-  if (!grace && (now - lastPacketMs > ESPNOW_TIMEOUT_MS)) ESP.restart();
+static uint32_t usbReplugCount = 0;
+#define MAX_REPLUG_ATTEMPTS 2
 
-  if (!grace && deviceActive) {
-    bool mounted = tud_mounted();
-    bool usbOk = mounted;
+void forceUsbReplug() {
+    deviceActive = false;
+    pendingActivate = false;
+    pendingDeactivate = false;
+    vTaskDelay(50);
 
-    if (!usbOk) {
-      if (usbBadSinceMs == 0)
-        usbBadSinceMs = now;
-      else if (now - usbBadSinceMs > USB_STUCK_MS)
-        ESP.restart();
-    } else {
-      usbBadSinceMs = 0;
-    }
-  } else {
+    tud_disconnect();
+    vTaskDelay(1000);
+    tud_connect();
+
     usbBadSinceMs = 0;
-  }
+    usbReplugCount++;
+}
 
-  delay(100);
+void loop() {
+    uint32_t now = millis();
+    bool grace = (now - bootMs) < BOOT_GRACE_MS;
+
+    if (!grace && (now - lastPacketMs > ESPNOW_TIMEOUT_MS)) {
+        ESP.restart();
+    }
+
+    if (!grace) {
+        bool mounted = tud_mounted(); 
+        bool suspended = tud_suspended();
+
+        if (!mounted && !suspended) {
+            if (usbBadSinceMs == 0) {
+                usbBadSinceMs = now;
+            } else if (now - usbBadSinceMs > USB_STUCK_MS) {
+                if (usbReplugCount < MAX_REPLUG_ATTEMPTS) {
+                    forceUsbReplug(); 
+                } else {
+                    ESP.restart(); 
+                }
+            }
+        } else {
+            usbBadSinceMs = 0;
+            usbReplugCount = 0; 
+        }
+    }
+
+    delay(100);
 }
 ```
 
@@ -528,6 +564,9 @@ static bool wasReboot = false;
 temperature_sensor_handle_t temp_handle = NULL;
 
 static volatile uint32_t lastActivityMs = 0;
+static volatile int lastIdleLevel = 0;
+static volatile bool screenTurnedOff = false;
+
 #define IDLE1_TIMEOUT_MS 300000
 #define IDLE2_TIMEOUT_MS 900000
 
@@ -536,8 +575,8 @@ static volatile uint32_t lastActivityMs = 0;
 #define IDLE1_MOUSE_SEND_US (1000000 / IDLE1_MOUSE_SEND_HZ)
 #define IDLE2_MOUSE_SEND_US (1000000 / IDLE2_MOUSE_SEND_HZ)
 
-#define IDLE1_HEARTBEAT_MS 3000
-#define IDLE2_HEARTBEAT_MS 10000
+#define IDLE1_HEARTBEAT_MS 750
+#define IDLE2_HEARTBEAT_MS 1000
 
 #define IDLE1_LOOP_MS 20
 #define IDLE2_LOOP_MS 100
@@ -1966,6 +2005,8 @@ struct scan_disp_entry_t {
 };
 
 static void drawUI() {
+  if(lastIdleLevel != 0) return;
+
   if (passkeyActive) {
     drawPasskey();
     return;
@@ -2265,7 +2306,9 @@ void loop() {
 
   uint32_t hbInterval;
   int loopDelay;
-  switch (idleLevel()) {
+
+  int idlelvl = idleLevel();
+  switch (idlelvl) {
     case 2:
       hbInterval = IDLE2_HEARTBEAT_MS;
       loopDelay = IDLE2_LOOP_MS;
@@ -2285,6 +2328,20 @@ void loop() {
     sendCmd(inactiveMac(), PKT_DEACTIVATE);
     lastBeat = millis();
   }
+
+if (idlelvl != lastIdleLevel) {
+    lastIdleLevel = idlelvl;
+    if (idlelvl == 0) {
+        M5.Display.wakeup();
+        M5.Display.setBrightness(128);
+        screenTurnedOff = false;
+    } else {
+        M5.Display.setBrightness(0);
+        M5.Display.sleep();
+        screenTurnedOff = true;
+    }
+    needRedraw = true;
+}
 
   bool cU = usbMouseReady, cB = bleKbdConnected, cP = passkeyActive;
   int cS = bleState;
