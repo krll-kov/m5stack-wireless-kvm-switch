@@ -2300,7 +2300,7 @@ static void drawUI() {
   } else if (batCnt < 4) {
       M5.Display.setTextColor(YELLOW);
       int secLeft = (4 - batCnt) * BAT_SAMPLE_MS / 1000;
-      M5.Display.printf("PWR: detecting (90s) %ds... (%d%%)", secLeft, batPct);
+      M5.Display.printf("PWR: detecting %ds... (%d%%)", secLeft, batPct);
   } else {
       M5.Display.setTextColor(RED);
       M5.Display.printf("BAT %d%% %.2fV", batPct, batV);
