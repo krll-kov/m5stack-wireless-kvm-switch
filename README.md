@@ -366,7 +366,7 @@ Before uploading, **update these values** in the sketch:
 | `ATOM_MAC_1[]` | MAC of first Atom S3U | `{0x3C, 0xDC, 0x75, 0xED, 0xFB, 0x4C}` |
 | `ATOM_MAC_2[]` | MAC of second Atom S3U | `{0xD0, 0xCF, 0x13, 0x0F, 0x90, 0x48}` |
 | `BLE_KBD_MATCH` | Part of your keyboard's BT name (no special chars) | `"Keyboard"` |
-| `MOUSE_SEND_HZ` | Mouse poll rate (lower if laggy), recommended to set slightly higher then your mouse polling rate, for example you have 500 - set 550-750 | `750` |
+| `MOUSE_SEND_HZ` | Mouse poll rate (lower if laggy), recommended to set slightly higher then your mouse polling rate, for example you have 500 - set 650-750 | `750` |
 | `USE_MAX_MODULE` | Set `true` if using the classic USB module | `false` |
 | `WITH_KEYBOARD` | Set `false` for mouse-only mode | `true` |
 | `BLE_PROBE_MIN_RSSI` | Raise to `-80` if keyboard is far away | `-55` |
@@ -399,7 +399,7 @@ uint8_t ATOM_MAC_2[] = {0xD0, 0xCF, 0x13, 0x0F, 0x90, 0x48};
 
 #define BLE_KBD_MATCH "Keyboard"
 #define ESPNOW_CHAN 1
-#define MOUSE_SEND_HZ 550
+#define MOUSE_SEND_HZ 750
 #define MOUSE_SEND_US (1000000 / MOUSE_SEND_HZ)
 #define SWITCH_DEBOUNCE_MS 300
 #define HEARTBEAT_MS 500
