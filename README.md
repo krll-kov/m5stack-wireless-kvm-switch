@@ -1073,55 +1073,6 @@ static void cleanupUsb() {
   usb_host_lib_handle_events(10, NULL);
 }
 
-static void fullUsbReset() {
-  usbMouseReady = false;
-  xferDead = false;
-  xferDeadMs = 0;
-  lastXferCbMs = 0;
-  devGone = false;
-  recoverFails = 0;
-
-  if (epAddr && usbDev) {
-    usb_host_endpoint_halt(usbDev, epAddr);
-    usb_host_endpoint_flush(usbDev, epAddr);
-    vTaskDelay(pdMS_TO_TICKS(60));
-    usb_host_client_handle_events(usbClient, 20);
-  }
-  if (xferIn) {
-    usb_host_transfer_free(xferIn);
-    xferIn = NULL;
-  }
-  if (usbDev) {
-    if (epAddr) usb_host_interface_release(usbClient, usbDev, hidIfNum);
-    usb_host_device_close(usbClient, usbDev);
-    usbDev = NULL;
-  }
-  epAddr = 0;
-
-  if (usbClient) {
-    usb_host_client_deregister(usbClient);
-    usbClient = NULL;
-  }
-  for (int i = 0; i < 5; i++)
-    usb_host_lib_handle_events(20, NULL);
-  usb_host_uninstall();
-
-  vTaskDelay(pdMS_TO_TICKS(500));
-
-  usb_host_config_t hc = {};
-  hc.skip_phy_setup = false;
-  hc.intr_flags = ESP_INTR_FLAG_LEVEL1;
-  usb_host_install(&hc);
-
-  usb_host_client_config_t cc = {};
-  cc.is_synchronous = false;
-  cc.max_num_event_msg = 5;
-  cc.async.client_event_callback = usbEventCb;
-  usb_host_client_register(&cc, &usbClient);
-
-  needRedraw = true;
-}
-
 static bool softRecoverUsb() {
   if (!usbDev) return false;
 
@@ -1198,7 +1149,6 @@ static bool findHidEp() {
   }
   return false;
 }
-
 void usbHostTask(void *) {
   usb_host_config_t hc = {};
   hc.skip_phy_setup = false;
@@ -1214,10 +1164,17 @@ void usbHostTask(void *) {
     usb_host_lib_handle_events(1, NULL);
     usb_host_client_handle_events(usbClient, 0);
 
-    if (usbResetRequest || recoverFails >= 3) {
+    if (usbResetRequest) {
       usbResetRequest = false;
-      fullUsbReset();
-      continue;
+      if (!usbMouseReady || xferDead) {
+        cleanupUsb();
+        needRedraw = true;
+      }
+    }
+
+    if (recoverFails >= 3) {
+      strncpy(rtcDbg, "usb-recover-fail", sizeof(rtcDbg));
+      ESP.restart();
     }
 
     if (devGone) {
