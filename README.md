@@ -139,6 +139,7 @@ Upload the following sketch to **both** Atom S3U devices:
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+
 #include "USB.h"
 #include "USBHIDKeyboard.h"
 #include "USBHIDMouse.h"
@@ -146,60 +147,78 @@ Upload the following sketch to **both** Atom S3U devices:
 
 // ── TinyUSB health-check functions (always linked when USB-OTG mode) ──
 extern "C" {
-  bool tud_mounted(void);
-  bool tud_suspended(void);
-  bool tud_remote_wakeup(void);
+bool tud_mounted(void);
+bool tud_suspended(void);
+bool tud_remote_wakeup(void);
 }
 
 #define ESPNOW_CHAN 1
 
-#define PKT_MOUSE      0x01
-#define PKT_KEYBOARD   0x02
-#define PKT_ACTIVATE   0x03
+#define PKT_MOUSE 0x01
+#define PKT_KEYBOARD 0x02
+#define PKT_ACTIVATE 0x03
 #define PKT_DEACTIVATE 0x04
-#define PKT_HEARTBEAT  0x05
+#define PKT_HEARTBEAT 0x05
 
 // ── Watchdog thresholds ──
-#define BOOT_GRACE_MS       5000   // USB enumeration grace period after boot
-#define ESPNOW_TIMEOUT_MS  1500   // no packets from CoreS3 → restart
-#define USB_STUCK_MS        4000   // USB unhealthy while active → restart
-#define USB_WAKEUP_EVERY   2000   // remote-wakeup attempt interval
+#define BOOT_GRACE_MS 5000      // USB enumeration grace period after boot
+#define ESPNOW_TIMEOUT_MS 1500  // no packets from CoreS3 → restart
+#define USB_STUCK_MS 4000       // USB unhealthy while active → restart
+#define USB_WAKEUP_EVERY 2000   // remote-wakeup attempt interval
 
 USBHIDKeyboard UsbKbd;
-USBHIDMouse    UsbMouse;
+USBHIDMouse UsbMouse;
 
 #pragma pack(push, 1)
-struct MousePkt { uint8_t btn; int16_t dx, dy; int8_t whl; };
-struct KbdPkt   { uint8_t mod; uint8_t keys[6]; };
+struct MousePkt {
+  uint8_t btn;
+  int16_t dx, dy;
+  int8_t whl;
+};
+struct KbdPkt {
+  uint8_t mod;
+  uint8_t keys[6];
+};
+struct HIDMouseReport {
+  uint8_t buttons;
+  int8_t x;
+  int8_t y;
+  int8_t wheel;
+  int8_t pan;
+};
 #pragma pack(pop)
 
 QueueHandle_t mouseQ;
 QueueHandle_t kbdQ;
 
-volatile bool deviceActive      = false;
-volatile bool pendingActivate   = false;
+volatile bool deviceActive = false;
+volatile bool pendingActivate = false;
 volatile bool pendingDeactivate = false;
 static uint8_t prevBtn = 0;
 
 // ── Health state ──
-static uint32_t bootMs         = 0;
+static uint32_t bootMs = 0;
 volatile uint32_t lastPacketMs = 0;
 static uint32_t usbBadSinceMs = 0;
-static uint32_t lastWakeupMs  = 0;
+static uint32_t lastWakeupMs = 0;
 
 void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (len < 1) return;
   lastPacketMs = millis();
 
   switch (data[0]) {
-    case PKT_ACTIVATE:   pendingActivate   = true; break;
-    case PKT_DEACTIVATE: pendingDeactivate = true; break;
+    case PKT_ACTIVATE:
+      pendingActivate = true;
+      break;
+    case PKT_DEACTIVATE:
+      pendingDeactivate = true;
+      break;
     case PKT_MOUSE:
       if (len >= 7) {
         MousePkt p;
         p.btn = data[1];
-        p.dx  = (int16_t)(data[2] | (data[3] << 8));
-        p.dy  = (int16_t)(data[4] | (data[5] << 8));
+        p.dx = (int16_t)(data[2] | (data[3] << 8));
+        p.dy = (int16_t)(data[4] | (data[5] << 8));
         p.whl = (int8_t)data[6];
         xQueueSend(mouseQ, &p, 0);
       }
@@ -212,7 +231,78 @@ void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
         xQueueSend(kbdQ, &k, 0);
       }
       break;
-    case PKT_HEARTBEAT: break;
+    case PKT_HEARTBEAT:
+      break;
+  }
+}
+
+void usbTask(void *pvParameters) {
+  MousePkt p;
+  KbdPkt k;
+  HIDMouseReport rpt;
+
+  while (true) {
+    if (pendingDeactivate) {
+      pendingDeactivate = false;
+      if (deviceActive) {
+        deviceActive = false;
+        UsbKbd.releaseAll();
+        UsbMouse.release(MOUSE_LEFT | MOUSE_RIGHT | MOUSE_MIDDLE);
+        prevBtn = 0;
+        xQueueReset(mouseQ);
+        xQueueReset(kbdQ);
+      }
+    }
+    if (pendingActivate) {
+      pendingActivate = false;
+      if (!deviceActive) {
+        UsbKbd.releaseAll();
+        UsbMouse.release(MOUSE_LEFT | MOUSE_RIGHT | MOUSE_MIDDLE);
+        prevBtn = 0;
+        deviceActive = true;
+      }
+    }
+
+    while (deviceActive && xQueueReceive(mouseQ, &p, 0) == pdTRUE) {
+      int16_t rx = p.dx;
+      int16_t ry = p.dy;
+      int8_t rw = p.whl;
+
+      do {
+        int8_t sx = (rx > 127) ? 127 : (rx < -127) ? -127 : (int8_t)rx;
+        int8_t sy = (ry > 127) ? 127 : (ry < -127) ? -127 : (int8_t)ry;
+
+        rpt.buttons = p.btn;
+        rpt.x = sx;
+        rpt.y = sy;
+        rpt.wheel = rw;
+        rpt.pan = 0;
+        UsbMouse.sendReport(rpt);
+
+        rx -= sx;
+        ry -= sy;
+        rw = 0;
+
+      } while (rx != 0 || ry != 0);
+
+      prevBtn = p.btn;
+    }
+
+    while (deviceActive && xQueueReceive(kbdQ, &k, 0) == pdTRUE) {
+      KeyReport rpt;
+      rpt.modifiers = k.mod;
+      rpt.reserved = 0;
+      memcpy(rpt.keys, k.keys, 6);
+      UsbKbd.sendReport(&rpt);
+    }
+
+    if (!deviceActive) {
+      vTaskDelay(10);
+      xQueueReset(mouseQ);
+      xQueueReset(kbdQ);
+    } else {
+      taskYIELD();
+    }
   }
 }
 
@@ -224,41 +314,32 @@ void setup() {
   USB.begin();
 
   mouseQ = xQueueCreate(128, sizeof(MousePkt));
-  kbdQ   = xQueueCreate(32,  sizeof(KbdPkt));
+  kbdQ = xQueueCreate(32, sizeof(KbdPkt));
 
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
+
+  esp_wifi_set_ps(WIFI_PS_NONE);
+
   esp_wifi_set_channel(ESPNOW_CHAN, WIFI_SECOND_CHAN_NONE);
-  if (esp_now_init() == ESP_OK)
-    esp_now_register_recv_cb(onRecv);
+  if (esp_now_init() == ESP_OK) esp_now_register_recv_cb(onRecv);
 
   lastPacketMs = millis();
+  xTaskCreatePinnedToCore(usbTask, "USB", 4096, NULL, 10, NULL, 1);
 }
 
 void loop() {
   uint32_t now = millis();
   bool grace = (now - bootMs) < BOOT_GRACE_MS;
+  if (!grace && (now - lastPacketMs > ESPNOW_TIMEOUT_MS)) ESP.restart();
 
-  // ══════════════════════════════════════════════
-  //  WATCHDOG 1 — ESP-NOW packet timeout
-  //  CoreS3 sends ACTIVATE/DEACTIVATE every 500ms.
-  //  If nothing arrives for 30s, radio link is dead.
-  // ══════════════════════════════════════════════
-  if (!grace && (now - lastPacketMs > ESPNOW_TIMEOUT_MS))
-    ESP.restart();
-
-  // ══════════════════════════════════════════════
-  //  WATCHDOG 2 — USB health
-  //  If TinyUSB reports not-mounted or suspended
-  //  while we're the active target → USB is stuck.
-  // ══════════════════════════════════════════════
   if (!grace && deviceActive) {
-    bool mounted   = tud_mounted();
-    bool suspended = tud_suspended();
-    bool usbOk     = mounted;
+    bool mounted = tud_mounted();
+    bool usbOk = mounted;
 
     if (!usbOk) {
-      if (usbBadSinceMs == 0) usbBadSinceMs = now;
+      if (usbBadSinceMs == 0)
+        usbBadSinceMs = now;
       else if (now - usbBadSinceMs > USB_STUCK_MS)
         ESP.restart();
     } else {
@@ -268,73 +349,7 @@ void loop() {
     usbBadSinceMs = 0;
   }
 
-  // ══════════════════════════════════════════════
-  //  Activate / Deactivate (unchanged logic)
-  // ══════════════════════════════════════════════
-  if (pendingDeactivate) {
-    pendingDeactivate = false;
-    if (deviceActive) {
-      deviceActive = false;
-      UsbKbd.releaseAll();
-      UsbMouse.release(MOUSE_LEFT | MOUSE_RIGHT | MOUSE_MIDDLE);
-      prevBtn = 0;
-      MousePkt dm; KbdPkt dk;
-      while (xQueueReceive(mouseQ, &dm, 0) == pdTRUE) {}
-      while (xQueueReceive(kbdQ,   &dk, 0) == pdTRUE) {}
-    }
-  }
-  if (pendingActivate) {
-    pendingActivate = false;
-    if (!deviceActive) {
-      UsbKbd.releaseAll();
-      UsbMouse.release(MOUSE_LEFT | MOUSE_RIGHT | MOUSE_MIDDLE);
-      prevBtn = 0;
-      deviceActive = true;
-    }
-  }
-
-  // ══════════════════════════════════════════════
-  //  Mouse processing
-  // ══════════════════════════════════════════════
-  MousePkt p;
-  while (deviceActive && xQueueReceive(mouseQ, &p, 0) == pdTRUE) {
-    if (p.btn != prevBtn) {
-      uint8_t chg = p.btn ^ prevBtn;
-      if (chg & 0x01) { (p.btn & 0x01) ? UsbMouse.press(MOUSE_LEFT)   : UsbMouse.release(MOUSE_LEFT);   }
-      if (chg & 0x02) { (p.btn & 0x02) ? UsbMouse.press(MOUSE_RIGHT)  : UsbMouse.release(MOUSE_RIGHT);  }
-      if (chg & 0x04) { (p.btn & 0x04) ? UsbMouse.press(MOUSE_MIDDLE) : UsbMouse.release(MOUSE_MIDDLE); }
-      prevBtn = p.btn;
-    }
-    int16_t rx = p.dx, ry = p.dy;
-    int8_t  rw = p.whl;
-    while (rx || ry || rw) {
-      int8_t sx = (int8_t)constrain(rx, -127, 127);
-      int8_t sy = (int8_t)constrain(ry, -127, 127);
-      UsbMouse.move(sx, sy, rw);
-      rx -= sx; ry -= sy; rw = 0;
-    }
-  }
-
-  // ══════════════════════════════════════════════
-  //  Keyboard processing
-  // ══════════════════════════════════════════════
-  KbdPkt k;
-  while (deviceActive && xQueueReceive(kbdQ, &k, 0) == pdTRUE) {
-    KeyReport rpt;
-    rpt.modifiers = k.mod;
-    rpt.reserved  = 0;
-    memcpy(rpt.keys, k.keys, 6);
-    UsbKbd.sendReport(&rpt);
-  }
-
-  // drain when inactive
-  if (!deviceActive) {
-    MousePkt dm; KbdPkt dk;
-    while (xQueueReceive(mouseQ, &dm, 0) == pdTRUE) {}
-    while (xQueueReceive(kbdQ,   &dk, 0) == pdTRUE) {}
-  }
-
-  delay(1);
+  delay(100);
 }
 ```
 
@@ -366,10 +381,11 @@ Before uploading, **update these values** in the sketch:
 | `ATOM_MAC_1[]` | MAC of first Atom S3U | `{0x3C, 0xDC, 0x75, 0xED, 0xFB, 0x4C}` |
 | `ATOM_MAC_2[]` | MAC of second Atom S3U | `{0xD0, 0xCF, 0x13, 0x0F, 0x90, 0x48}` |
 | `BLE_KBD_MATCH` | Part of your keyboard's BT name (no special chars) | `"Keyboard"` |
-| `MOUSE_SEND_HZ` | Mouse poll rate (lower if laggy), recommended to set slightly higher then your mouse polling rate, for example you have 500 - set 650-750 | `750` |
+| `MOUSE_SEND_HZ` | Set higher than actual mouse input rate to get real number, for example if mouse is 1000, set this to 2100 and you'll get real 1000 (you can verify number with debug mode), it's just how delay works in programming | `2100` |
 | `USE_MAX_MODULE` | Set `true` if using the classic USB module | `false` |
 | `WITH_KEYBOARD` | Set `false` for mouse-only mode | `true` |
 | `BLE_PROBE_MIN_RSSI` | Raise to `-80` if keyboard is far away | `-55` |
+| `DEBUG_MODE` | Set to true to see debug mode stats, usefull for MOUSE_SEND_HZ measuring | `false` |
 
 > 💡 The switch button is bound to **Mouse4** (`m.buttons & 0x08`) by default.
 
@@ -385,6 +401,7 @@ Before uploading, **update these values** in the sketch:
 #include <esp_now.h>
 #include <esp_wifi.h>
 
+#include "driver/temperature_sensor.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/semphr.h"
@@ -394,12 +411,17 @@ Before uploading, **update these values** in the sketch:
 #define WITH_KEYBOARD true
 #define USE_MAX_MODULE false
 
+// Set true to show poll-rate / queue / send-rate overlay
+#define DEBUG_MODE false
+
 uint8_t ATOM_MAC_1[] = {0x3C, 0xDC, 0x75, 0xED, 0xFB, 0x4C};
 uint8_t ATOM_MAC_2[] = {0xD0, 0xCF, 0x13, 0x0F, 0x90, 0x48};
 
 #define BLE_KBD_MATCH "Keyboard"
 #define ESPNOW_CHAN 1
-#define MOUSE_SEND_HZ 750
+// Real send speed will be 1000 with this number, it just has to be higher than
+// actual mouse hz input
+#define MOUSE_SEND_HZ 2100
 #define MOUSE_SEND_US (1000000 / MOUSE_SEND_HZ)
 #define SWITCH_DEBOUNCE_MS 300
 #define HEARTBEAT_MS 500
@@ -503,10 +525,11 @@ static volatile bool classicScanDone = false;
 
 RTC_NOINIT_ATTR char rtcDbg[48];
 static bool wasReboot = false;
+temperature_sensor_handle_t temp_handle = NULL;
 
 static volatile uint32_t lastActivityMs = 0;
-#define IDLE1_TIMEOUT_MS  300000   // 5 min - light idle
-#define IDLE2_TIMEOUT_MS  900000   // 15 min — deep idle
+#define IDLE1_TIMEOUT_MS 300000
+#define IDLE2_TIMEOUT_MS 900000
 
 #define IDLE1_MOUSE_SEND_HZ 30
 #define IDLE2_MOUSE_SEND_HZ 2
@@ -525,6 +548,29 @@ static int idleLevel() {
   if (dt > IDLE1_TIMEOUT_MS) return 1;
   return 0;
 }
+
+// ── Debug stats (compiled out when DEBUG_MODE=false) ──
+#if DEBUG_MODE
+static volatile uint32_t dbgUsbCb = 0, dbgUsbHz = 0;
+static volatile uint32_t dbgEspTx = 0, dbgEspHz = 0;
+static volatile uint32_t dbgMsTx = 0, dbgMsHz = 0;
+static volatile int dbgQPeak = 0;
+static uint32_t dbgLastTick = 0;
+static void dbgTick() {
+  uint32_t now = millis();
+  if (now - dbgLastTick >= 1000) {
+    dbgUsbHz = dbgUsbCb;
+    dbgUsbCb = 0;
+    dbgEspHz = dbgEspTx;
+    dbgEspTx = 0;
+    dbgMsHz = dbgMsTx;
+    dbgMsTx = 0;
+    dbgQPeak = 0;
+    dbgLastTick = now;
+    needRedraw = true;
+  }
+}
+#endif
 
 struct seen_dev_t {
   NimBLEAddress addr;
@@ -647,6 +693,9 @@ static void txMouse(const mouse_evt_t *m) {
                   (uint8_t)((m->y >> 8) & 0xFF),
                   (uint8_t)m->wheel};
   esp_now_send(activeMac(), p, 7);
+#if DEBUG_MODE
+  dbgEspTx++;
+#endif
 }
 static void txKbd(const kbd_evt_t *k) {
   uint8_t p[8] = {PKT_KEYBOARD, k->modifiers};
@@ -1025,7 +1074,7 @@ void max3421Task(void *) { vTaskDelete(NULL); }
 // ===================== USB MOUSE HOST =====================
 static usb_host_client_handle_t usbClient = NULL;
 static usb_device_handle_t usbDev = NULL;
-static usb_transfer_t *xferIn = NULL;
+static usb_transfer_t *xfers[2] = {NULL, NULL};
 static uint8_t epAddr = 0, hidIfNum = 0;
 static volatile bool devGone = false, xferDead = false;
 static uint32_t xferDeadMs = 0;
@@ -1037,8 +1086,16 @@ static bool findHidEp();
 
 static void mouseXferCb(usb_transfer_t *xfer) {
   lastXferCbMs = millis();
+#if DEBUG_MODE
+  dbgUsbCb++;
+#endif
+
   if (switchInProgress) {
-    if (usbDev && xferIn) usb_host_transfer_submit(xferIn);
+    if (usbDev && xfer) {
+      if (usb_host_transfer_submit(xfer) != ESP_OK) xferDead = true;
+    } else {
+      xferDead = true;
+    }
     return;
   }
 
@@ -1049,11 +1106,15 @@ static void mouseXferCb(usb_transfer_t *xfer) {
     int len = xfer->actual_num_bytes;
     mouse_evt_t evt = {};
     if (len == 4) {
-      evt.buttons = d[0]; evt.x = (int8_t)d[1];
-      evt.y = (int8_t)d[2]; evt.wheel = (int8_t)d[3];
+      evt.buttons = d[0];
+      evt.x = (int8_t)d[1];
+      evt.y = (int8_t)d[2];
+      evt.wheel = (int8_t)d[3];
     } else if (len == 5) {
-      evt.buttons = d[1]; evt.x = (int8_t)d[2];
-      evt.y = (int8_t)d[3]; evt.wheel = (int8_t)d[4];
+      evt.buttons = d[1];
+      evt.x = (int8_t)d[2];
+      evt.y = (int8_t)d[3];
+      evt.wheel = (int8_t)d[4];
     } else if (len == 6) {
       evt.buttons = d[0];
       evt.x = (int16_t)(d[1] | (d[2] << 8));
@@ -1073,16 +1134,15 @@ static void mouseXferCb(usb_transfer_t *xfer) {
     return;
   }
 
-  if (usbDev && xferIn) {
-    if (usb_host_transfer_submit(xferIn) != ESP_OK) xferDead = true;
+  if (usbDev && xfer) {
+    if (usb_host_transfer_submit(xfer) != ESP_OK) xferDead = true;
   } else
     xferDead = true;
 }
 
 static void usbEventCb(const usb_host_client_event_msg_t *msg, void *) {
   if (msg->event == USB_HOST_CLIENT_EVENT_NEW_DEV) {
-    if (!usbDev)
-      usb_host_device_open(usbClient, msg->new_dev.address, &usbDev);
+    if (!usbDev) usb_host_device_open(usbClient, msg->new_dev.address, &usbDev);
   } else if (msg->event == USB_HOST_CLIENT_EVENT_DEV_GONE)
     devGone = true;
 }
@@ -1090,10 +1150,13 @@ static void usbEventCb(const usb_host_client_event_msg_t *msg, void *) {
 static void cleanupUsb() {
   usbMouseReady = false;
   usb_host_client_handle_events(usbClient, 10);
-  if (xferIn) {
-    usb_host_transfer_free(xferIn);
-    xferIn = NULL;
+  for (int i = 0; i < 2; i++) {
+    if (xfers[i]) {
+      usb_host_transfer_free(xfers[i]);
+      xfers[i] = NULL;
+    }
   }
+
   if (usbDev) {
     if (epAddr) usb_host_interface_release(usbClient, usbDev, hidIfNum);
     usb_host_device_close(usbClient, usbDev);
@@ -1108,10 +1171,11 @@ static void cleanupUsb() {
 
 static bool softRecoverUsb() {
   if (!usbDev) return false;
-
-  if (xferIn) {
-    usb_host_transfer_free(xferIn);
-    xferIn = NULL;
+  for (int i = 0; i < 2; i++) {
+    if (xfers[i]) {
+      usb_host_transfer_free(xfers[i]);
+      xfers[i] = NULL;
+    }
   }
   if (epAddr) {
     usb_host_interface_release(usbClient, usbDev, hidIfNum);
@@ -1121,11 +1185,9 @@ static bool softRecoverUsb() {
   xferDead = false;
   xferDeadMs = 0;
   lastXferCbMs = 0;
-
   if (devGone) return false;
   vTaskDelay(pdMS_TO_TICKS(200));
   if (devGone) return false;
-
   if (findHidEp()) {
     usbMouseReady = true;
     lastXferCbMs = millis();
@@ -1146,6 +1208,7 @@ static bool findHidEp() {
   int off = 0, total = cfg->wTotalLength;
   uint8_t curIf = 0;
   bool isH = false;
+
   while (off < total) {
     uint8_t dL = p[off], dT = (dL >= 2) ? p[off + 1] : 0;
     if (!dL) break;
@@ -1160,17 +1223,25 @@ static bool findHidEp() {
         hidIfNum = curIf;
         if (usb_host_interface_claim(usbClient, usbDev, hidIfNum, 0) != ESP_OK)
           return false;
-        if (usb_host_transfer_alloc(mps, 0, &xferIn) != ESP_OK) return false;
-        xferIn->device_handle = usbDev;
-        xferIn->bEndpointAddress = a;
-        xferIn->callback = mouseXferCb;
-        xferIn->num_bytes = mps;
-        xferIn->timeout_ms = 0;
-        if (usb_host_transfer_submit(xferIn) != ESP_OK) {
-          usb_host_transfer_free(xferIn);
-          xferIn = NULL;
-          return false;
+
+        for (int i = 0; i < 2; i++) {
+          if (usb_host_transfer_alloc(mps, 0, &xfers[i]) != ESP_OK) {
+            if (i > 0) usb_host_transfer_free(xfers[0]);
+            return false;
+          }
+          xfers[i]->device_handle = usbDev;
+          xfers[i]->bEndpointAddress = a;
+          xfers[i]->callback = mouseXferCb;
+          xfers[i]->num_bytes = mps;
+          xfers[i]->timeout_ms = 0;
+
+          if (usb_host_transfer_submit(xfers[i]) != ESP_OK) {
+            usb_host_transfer_free(xfers[i]);
+            xfers[i] = NULL;
+            return false;
+          }
         }
+
         epAddr = a;
         xferDead = false;
         xferDeadMs = 0;
@@ -1182,10 +1253,11 @@ static bool findHidEp() {
   }
   return false;
 }
+
 void usbHostTask(void *) {
   usb_host_config_t hc = {};
   hc.skip_phy_setup = false;
-  hc.intr_flags = ESP_INTR_FLAG_LEVEL1;
+  hc.intr_flags = ESP_INTR_FLAG_LEVEL2;
   usb_host_install(&hc);
   usb_host_client_config_t cc = {};
   cc.is_synchronous = false;
@@ -1226,7 +1298,12 @@ void usbHostTask(void *) {
         }
       } else {
         vTaskDelay(pdMS_TO_TICKS(50));
-        if (xferIn && usb_host_transfer_submit(xferIn) == ESP_OK) {
+        bool anyOk = false;
+        for (int i = 0; i < 2; i++) {
+          if (xfers[i] && usb_host_transfer_submit(xfers[i]) == ESP_OK)
+            anyOk = true;
+        }
+        if (anyOk) {
           xferDead = false;
           xferDeadMs = 0;
           lastXferCbMs = millis();
@@ -1243,7 +1320,7 @@ void usbHostTask(void *) {
       }
     }
 
-    vTaskDelay(pdMS_TO_TICKS(1));
+    taskYIELD();
   }
 }
 
@@ -1262,41 +1339,59 @@ void mouseSendTask(void *) {
       vTaskDelay(pdMS_TO_TICKS(2));
       continue;
     }
-    int waitMs = (idleLevel() >= 2) ? 50 : (idleLevel() == 1) ? 5 : 1;
-    bool got = xQueueReceive(mouseQueue, &m, pdMS_TO_TICKS(waitMs)) == pdTRUE;
+    TickType_t waitTicks = (idleLevel() == 0)
+                               ? portMAX_DELAY
+                               : pdMS_TO_TICKS((idleLevel() >= 2) ? 50 : 5);
+    bool got = xQueueReceive(mouseQueue, &m, waitTicks) == pdTRUE;
+
+    // Batch-drain: if we got one, grab all pending without blocking
     if (got && !switchInProgress) {
-      bool m4 = (m.buttons & 0x08);
-      if (m4 && !m4h && millis() - lastSwitchMs > SWITCH_DEBOUNCE_MS)
-        switchRequest = true;
-      m4h = m4;
-      uint8_t b3 = m.buttons & 0x07;
-      bool bc = (b3 != prevBtn);
-      acc.buttons = m.buttons;
-      acc.x += m.x;
-      acc.y += m.y;
-      acc.wheel += m.wheel;
-      dirty = true;
-      if (bc) {
-        txMouse(&acc);
-        prevBtn = b3;
-        acc = {};
+      do {
+        bool m4 = (m.buttons & 0x08);
+        if (m4 && !m4h && millis() - lastSwitchMs > SWITCH_DEBOUNCE_MS)
+          switchRequest = true;
+        m4h = m4;
+        uint8_t b3 = m.buttons & 0x07;
+        bool bc = (b3 != prevBtn);
         acc.buttons = m.buttons;
-        dirty = false;
-        lastUs = micros();
-      }
+        acc.x += m.x;
+        acc.y += m.y;
+        acc.wheel += m.wheel;
+        dirty = true;
+        if (bc) {
+          txMouse(&acc);
+          prevBtn = b3;
+          acc = {};
+          acc.buttons = m.buttons;
+          dirty = false;
+          lastUs = micros();
+#if DEBUG_MODE
+          dbgMsTx++;
+#endif
+        }
+      } while (!switchInProgress && xQueueReceive(mouseQueue, &m, 0) == pdTRUE);
     }
 
     uint32_t sendInterval;
     switch (idleLevel()) {
-      case 2:  sendInterval = IDLE2_MOUSE_SEND_US; break;
-      case 1:  sendInterval = IDLE1_MOUSE_SEND_US; break;
-      default: sendInterval = MOUSE_SEND_US; break;
+      case 2:
+        sendInterval = IDLE2_MOUSE_SEND_US;
+        break;
+      case 1:
+        sendInterval = IDLE1_MOUSE_SEND_US;
+        break;
+      default:
+        sendInterval = MOUSE_SEND_US;
+        break;
     }
     if (dirty && micros() - lastUs >= sendInterval) {
       txMouse(&acc);
       acc = {};
       dirty = false;
       lastUs = micros();
+#if DEBUG_MODE
+      dbgMsTx++;
+#endif
     }
   }
 }
@@ -1544,7 +1639,6 @@ static void doAppleProbe(NimBLEClient *c, int si, int pn, int tot) {
     bleState = 2;
     needRedraw = true;
   }
-
   if (c->isConnected()) waitDisconn(c, 5000);
   passkeyActive = false;
   pairingDone = false;
@@ -1707,7 +1801,6 @@ void bleTask(void *) {
       classicScanRequest = true;
     }
 
-    // scan bursts with WiFi gaps
     uint32_t budgetStart = millis();
     while (!bleFound && (millis() - budgetStart < BLE_SCAN_BUDGET_MS)) {
       bleScanDone = false;
@@ -1721,7 +1814,6 @@ void bleTask(void *) {
         vTaskDelay(pdMS_TO_TICKS(50));
       scan->stop();
       if (bleFound) break;
-      // WiFi-only gap
       vTaskDelay(pdMS_TO_TICKS(BLE_SCAN_GAP_MS));
     }
     scan->stop();
@@ -1747,22 +1839,19 @@ void bleTask(void *) {
       continue;
     }
 
-    // ============ PROBING: single list sorted by RSSI ============
     int sorted[SEEN_DEV_MAX], sortedN = getTopByRssi(sorted, SEEN_DEV_MAX);
     int probeList[BLE_PROBE_MAX], probeCnt = 0;
-
     for (int s = 0; s < sortedN && probeCnt < BLE_PROBE_MAX; s++) {
       int i = sorted[s];
       if (seenDevs[i].rssi < BLE_PROBE_MIN_RSSI) continue;
       if (seenDevs[i].name[0]) continue;
       probeList[probeCnt++] = i;
     }
-
     probeTotalExpected = probeCnt;
     probeLogCount = 0;
 
     if (probeCnt > 0 && !bleFound) {
-      strncpy(rtcDbg, "probe-start", sizeof(rtcDbg));  
+      strncpy(rtcDbg, "probe-start", sizeof(rtcDbg));
       if (!pc) {
         pc = NimBLEDevice::createClient();
         if (pc) pc->setClientCallbacks(&secCb);
@@ -1771,10 +1860,7 @@ void bleTask(void *) {
         for (int p = 0; p < probeCnt && !bleFound; p++) {
           int si = probeList[p];
           if (si < 0 || si >= SEEN_DEV_MAX || !seenDevs[si].used) continue;
-
           bool apple = seenDevs[si].isApple;
-
-          // switch global sec-mode BEFORE this connection
           if (apple) {
             strncpy(rtcDbg, "apple-probe", sizeof(rtcDbg));
             setKbdSecMode();
@@ -1786,12 +1872,9 @@ void bleTask(void *) {
             pc->setConnectionParams(12, 24, 0, 200);
             doProbe(pc, si, p + 1, probeCnt);
           }
-
-          // make sure fully disconnected before next
           if (pc->isConnected()) waitDisconn(pc, 3000);
           vTaskDelay(pdMS_TO_TICKS(apple ? 1000 : 600));
         }
-
         if (pc->isConnected()) waitDisconn(pc, 3000);
         strncpy(rtcDbg, "probe-cleanup", sizeof(rtcDbg));
         passkeyActive = false;
@@ -2052,18 +2135,32 @@ static void drawUI() {
     }
   }
 
-  M5.Display.setCursor(5, 230);
+  // Footer line 1: debug or standard
   M5.Display.setTextSize(1);
-  M5.Display.setTextColor(DARKGREY);
-  M5.Display.printf("stk:%d idle:%d heap:%d",
-    uxTaskGetStackHighWaterMark(NULL),
-    idleLevel(),
-    esp_get_free_heap_size() / 1024);
+#if DEBUG_MODE
+  float cpuTemp = 0;
+  if (temp_handle) temperature_sensor_get_celsius(temp_handle, &cpuTemp);
 
+  M5.Display.setCursor(5, 210);
+  M5.Display.setTextColor(cpuTemp > 60 ? RED : CYAN);
+  // T:Temp | U:InputHz | E:OutputHz | Q:Queue
+  M5.Display.printf("T:%.0fC U:%d E:%d Q:%d", cpuTemp, (int)dbgUsbHz,
+                    (int)dbgEspHz, dbgQPeak);
+#endif
   M5.Display.setCursor(5, 220);
-  M5.Display.setTextSize(1);
   M5.Display.setTextColor(wasReboot ? RED : DARKGREY);
   M5.Display.printf("%s%s", wasReboot ? "!" : "", rtcDbg);
+
+  int bat = M5.Power.getBatteryLevel();
+
+  M5.Display.setCursor(5, 230);
+
+  M5.Display.setTextColor(bat < 20 ? RED : GREEN);
+  M5.Display.printf("Bat:%d%%  ", bat);
+
+  M5.Display.setTextColor(DARKGREY);
+  M5.Display.printf("S:%d H:%d", uxTaskGetStackHighWaterMark(NULL),
+                    esp_get_free_heap_size() / 1024);
 
   M5.Display.endWrite();
 }
@@ -2099,6 +2196,13 @@ void setup() {
   mouseQueue = xQueueCreate(128, sizeof(mouse_evt_t));
   kbdQueue = xQueueCreate(32, sizeof(kbd_evt_t));
 
+#if DEBUG_MODE
+  temperature_sensor_config_t temp_sensor_config =
+      TEMPERATURE_SENSOR_CONFIG_DEFAULT(10, 80);
+  temperature_sensor_install(&temp_sensor_config, &temp_handle);
+  temperature_sensor_enable(temp_handle);
+#endif
+
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
   esp_wifi_set_channel(ESPNOW_CHAN, WIFI_SECOND_CHAN_NONE);
@@ -2118,18 +2222,21 @@ void setup() {
   sendCmd(ATOM_MAC_1, PKT_ACTIVATE);
   sendCmd(ATOM_MAC_2, PKT_DEACTIVATE);
 
-  xTaskCreatePinnedToCore(usbHostTask, "USB", 8192, NULL, 5, NULL, 1);
-  xTaskCreatePinnedToCore(mouseSendTask, "MOUSE", 4096, NULL, 6, NULL, 1);
+  xTaskCreatePinnedToCore(usbHostTask, "USB", 8192, NULL, 10, NULL, 1);
+  xTaskCreatePinnedToCore(mouseSendTask, "MOUSE", 4096, NULL, 9, NULL, 0);
 
 #if WITH_KEYBOARD
   xTaskCreatePinnedToCore(bleTask, "BLE", 64 * 1024, NULL, 1, NULL, 0);
 #if USE_MAX_MODULE
-  xTaskCreatePinnedToCore(max3421Task, "MAX", 8192, NULL, 1, NULL, 1);
+  xTaskCreatePinnedToCore(max3421Task, "MAX", 8192, NULL, 1, NULL, 0);
 #endif
 #endif
 
   delay(300);
   lastActivityMs = millis();
+#if DEBUG_MODE
+  dbgLastTick = millis();
+#endif
   drawUI();
 }
 
@@ -2140,6 +2247,11 @@ static int prevBleS = -1;
 
 void loop() {
   M5.update();
+#if DEBUG_MODE
+  dbgTick();
+  int qn = uxQueueMessagesWaiting(mouseQueue);
+  if (qn > dbgQPeak) dbgQPeak = qn;
+#endif
 
   if ((M5.BtnA.wasPressed() || switchRequest) &&
       millis() - lastSwitchMs > SWITCH_DEBOUNCE_MS) {
@@ -2154,9 +2266,18 @@ void loop() {
   uint32_t hbInterval;
   int loopDelay;
   switch (idleLevel()) {
-    case 2:  hbInterval = IDLE2_HEARTBEAT_MS; loopDelay = IDLE2_LOOP_MS; break;
-    case 1:  hbInterval = IDLE1_HEARTBEAT_MS; loopDelay = IDLE1_LOOP_MS; break;
-    default: hbInterval = HEARTBEAT_MS;       loopDelay = 1;             break;
+    case 2:
+      hbInterval = IDLE2_HEARTBEAT_MS;
+      loopDelay = IDLE2_LOOP_MS;
+      break;
+    case 1:
+      hbInterval = IDLE1_HEARTBEAT_MS;
+      loopDelay = IDLE1_LOOP_MS;
+      break;
+    default:
+      hbInterval = HEARTBEAT_MS;
+      loopDelay = 1;
+      break;
   }
 
   if (millis() - lastBeat > hbInterval) {
