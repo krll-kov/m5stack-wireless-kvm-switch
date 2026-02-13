@@ -136,7 +136,7 @@ Upload the following sketch to **both** Atom S3U devices:
 <summary>📄 <b>Atom S3U Receiver Sketch</b> — click to expand</summary>
 
 ```ino
-
+https://github.com/krll-kov/m5stack-wireless-kvm-switch/blob/main/ino_atoms3u.ino
 ```
 
 </details>
@@ -179,7 +179,7 @@ Before uploading, **update these values** in the sketch:
 <summary>📄 <b>CoreS3 SE Main Controller Sketch</b> — click to expand</summary>
 
 ```ino
-
+https://github.com/krll-kov/m5stack-wireless-kvm-switch/blob/main/ino_cores3se.ino
 ```
 
 </details>
