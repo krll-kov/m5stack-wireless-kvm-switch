@@ -85,7 +85,7 @@ https://m5stack.oss-cn-shenzhen.aliyuncs.com/resource/arduino/package_m5stack_in
 - `M5Unified`  
 - `NimBLE-Arduino` (by h2zero)
 - `FastLED` (by Daniel Garcia)
-- Open Sketch -> Include library -> Add .zip Library... and select "M5-Max3421E-USBShield-master.zip" file (download in this repo). This is fixed driver for latest Arduino without TinyUSB and with resolved conflicts. Original version was taken from here: https://github.com/m5stack/M5-Max3421E-USBShield
+- Open Sketch -> Include library -> Add .zip Library... and select "[M5-Max3421E-USBShield-master.zip](https://github.com/krll-kov/m5stack-wireless-kvm-switch/blob/main/M5-Max3421E-USBShield-master.zip)" file (download in this repo). This is fixed driver for latest Arduino without TinyUSB and with resolved conflicts. Original version was taken from here: https://github.com/m5stack/M5-Max3421E-USBShield
 
 <img width="828" alt="Library manager" src="https://github.com/user-attachments/assets/e6a6d9ba-8ea7-4ac3-9e12-511c020b295e" />
 
