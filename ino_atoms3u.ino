@@ -6,6 +6,7 @@
 #include "USB.h"
 #include "USBHIDKeyboard.h"
 #include "USBHIDMouse.h"
+#include "USBHIDConsumerControl.h"
 #include "freertos/queue.h"
 
 // ── TinyUSB health-check functions (always linked when USB-OTG mode) ──
@@ -24,6 +25,7 @@ void tud_connect(void);
 #define PKT_ACTIVATE 0x03
 #define PKT_DEACTIVATE 0x04
 #define PKT_HEARTBEAT 0x05
+#define PKT_CONSUMER 0x06
 
 // ── Watchdog thresholds ──
 #define BOOT_GRACE_MS 5000      // USB enumeration grace period after boot
@@ -32,13 +34,18 @@ void tud_connect(void);
 static uint32_t usbGoneSinceMs = 0;
 #define USB_GONE_REPLUG_MS 30000
 
+#define USB_IDLE_TIMEOUT_MS_4 900000
+#define USB_IDLE_DELAY_MS_4   100
+#define USB_IDLE_TIMEOUT_MS_3 300000
+#define USB_IDLE_DELAY_MS_3   50
 #define USB_IDLE_TIMEOUT_MS_2 60000
-#define USB_IDLE_DELAY_MS_2   250
+#define USB_IDLE_DELAY_MS_2   20
 #define USB_IDLE_TIMEOUT_MS_1 10000
 #define USB_IDLE_DELAY_MS_1  1
 
 USBHIDKeyboard UsbKbd;
 USBHIDMouse UsbMouse;
+USBHIDConsumerControl UsbConsumer;
 
 #pragma pack(push, 1)
 struct MousePkt {
@@ -100,6 +107,15 @@ void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
         xQueueSend(kbdQ, &k, 0);
       }
       break;
+    case PKT_CONSUMER:
+      if (len >= 3 && deviceActive) {
+        uint16_t usage = data[1] | ((uint16_t)data[2] << 8);
+        if (usage)
+          UsbConsumer.press(usage);
+        else
+          UsbConsumer.release();
+      }
+      break;
     case PKT_HEARTBEAT:
       break;
   }
@@ -128,6 +144,7 @@ void usbTask(void *pvParameters) {
         deviceActive = false;
         UsbKbd.releaseAll();
         UsbMouse.release(MOUSE_LEFT | MOUSE_RIGHT | MOUSE_MIDDLE);
+        UsbConsumer.release();
         prevBtn = 0;
         xQueueReset(mouseQ);
         xQueueReset(kbdQ);
@@ -191,7 +208,11 @@ void usbTask(void *pvParameters) {
       xQueueReset(kbdQ);
     } else {
       uint32_t millisNow = millis() - lastInputMs;
-      if (millisNow > USB_IDLE_TIMEOUT_MS_2) {
+      if (millisNow > USB_IDLE_TIMEOUT_MS_4) {
+          vTaskDelay(pdMS_TO_TICKS(USB_IDLE_DELAY_MS_4));  
+      } else if (millisNow > USB_IDLE_TIMEOUT_MS_3) {
+          vTaskDelay(pdMS_TO_TICKS(USB_IDLE_DELAY_MS_3));  
+      } else if (millisNow > USB_IDLE_TIMEOUT_MS_2) {
           vTaskDelay(pdMS_TO_TICKS(USB_IDLE_DELAY_MS_2));
       } else if (millisNow > USB_IDLE_TIMEOUT_MS_1) {
           vTaskDelay(pdMS_TO_TICKS(USB_IDLE_DELAY_MS_1));  
@@ -207,6 +228,7 @@ void setup() {
 
   UsbMouse.begin();
   UsbKbd.begin();
+  UsbConsumer.begin();
   USB.usbAttributes(0xA0);
   USB.begin();
 

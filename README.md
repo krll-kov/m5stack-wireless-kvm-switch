@@ -82,12 +82,276 @@ https://m5stack.oss-cn-shenzhen.aliyuncs.com/resource/arduino/package_m5stack_in
 
 **Tools → Manage Libraries** — install:
 
-- `M5Unified`  
+- `M5Unified`
 - `NimBLE-Arduino` (by h2zero)
 - `FastLED` (by Daniel Garcia)
-- Open Sketch -> Include library -> Add .zip Library... and select "[M5-Max3421E-USBShield-master.zip](https://github.com/krll-kov/m5stack-wireless-kvm-switch/blob/main/M5-Max3421E-USBShield-master.zip)" file (download in this repo). This is fixed driver for latest Arduino without TinyUSB and with resolved conflicts. Original version was taken from here: https://github.com/m5stack/M5-Max3421E-USBShield
+- `USB Host Shield Library 2.0` (by Oleg Mazurov / Circuits At Home) — then apply pin modifications below
 
 <img width="828" alt="Library manager" src="https://github.com/user-attachments/assets/e6a6d9ba-8ea7-4ac3-9e12-511c020b295e" />
+
+### USB Module V1.2 — DIP Switch Configuration
+
+The M5Stack USB Module V1.2 has DIP switches on the back that select which GPIO pins are used for SS (chip select) and INT (interrupt). Set them as follows for CoreS3 SE:
+
+| Switch | Position |
+|--------|----------|
+| SS G13 | **OFF** |
+| SS G5  | **ON** |
+| SS G0  | **OFF** |
+| INT G35 | **ON** |
+| INT G34 | **OFF** |
+
+This selects **SS2** (G5 → remapped to G1 in software) and **INT1** (G35 → remapped to G10 in software).
+
+> The physical DIP switch labels refer to the original M5Stack Core pin mapping. On CoreS3 SE these module connector pins are routed to different GPIOs — the library pin modifications below handle the remapping.
+
+### USB Host Shield 2.0 — Pin Modifications for CoreS3 SE
+
+After installing the library, modify these 6 files in your Arduino libraries folder (typically `~/Documents/Arduino/libraries/USB_Host_Shield_Library_2.0/`):
+
+**Pin configuration (4 files):**
+
+1. **`avrpins.h`** — add after the line `MAKE_PIN(P17, 17);` (in the ESP32 section):
+   ```cpp
+   MAKE_PIN(P35, 35);
+   MAKE_PIN(P36, 36);
+   MAKE_PIN(P37, 37);
+   ```
+
+2. **`usbhost.h`** — change the ESP32 `spi` typedef:
+   ```cpp
+   typedef SPi< P36, P37, P35, P1 > spi;  // SCK=36, MOSI=37, MISO=35, SS=1(CS)
+   ```
+   Also add an ESP32 case in `SPi::init()` so `SPI.begin()` uses the correct pins:
+   ```cpp
+   #if defined(ESP32)
+           USB_SPI.begin(36, 35, 37, -1); // SCK=36, MISO=35, MOSI=37, no HW SS
+   #else
+           USB_SPI.begin();
+   #endif
+   ```
+
+3. **`UsbCore.h`** — change the ESP32 `MAX3421E` typedef:
+   ```cpp
+   typedef MAX3421e<P1, P10> MAX3421E;  // SS=GPIO1(CS), INT=GPIO10
+   ```
+
+4. **`settings.h`** — enable debug output (optional):
+   ```cpp
+   #define ENABLE_UHS_DEBUGGING 1
+   ```
+
+**SSP (Secure Simple Pairing) for Apple keyboards (2 files):**
+
+5. **`BTD.h`** — add two event defines (after the existing `EV_` defines, around line 110):
+   ```cpp
+   #define EV_USER_PASSKEY_REQUEST                         0x34
+   #define EV_USER_PASSKEY_NOTIFICATION                    0x3B
+   ```
+   Add a passkey variable (after `char remote_name[30];`, around line 492):
+   ```cpp
+   /** SSP passkey for Passkey Entry (displayed to user, typed on keyboard). */
+   uint32_t sspPasskey;
+   ```
+
+6. **`BTD.cpp`** — three changes:
+
+   a) In `hci_io_capability_request_reply()` (around line 1401), change IO capability from `0x03` (NoInputNoOutput) to `0x01` (DisplayOnly) and auth requirement to `0x04` (MITM Required):
+   ```cpp
+   hcibuf[9] = 0x01;  // DisplayOnly (was 0x03)
+   hcibuf[10] = 0x00; // OOB authentication data not present
+   hcibuf[11] = 0x04; // MITM Required, Dedicated Bonding (was 0x02)
+   ```
+
+   b) Add passkey event handlers in `ACL_event_task()` — in the HCI event switch, after the `EV_USER_CONFIRMATION_REQUEST` case (around line 714), add:
+   ```cpp
+   case EV_USER_PASSKEY_REQUEST:
+   #ifdef DEBUG_USB_HOST
+           Notify(PSTR("\r\nUser Passkey Request"), 0x80);
+   #endif
+           {
+                   uint8_t buf[9];
+                   buf[0] = 0x2F; buf[1] = 0x01 << 2; buf[2] = 0x06;
+                   for(uint8_t i = 0; i < 6; i++) buf[3 + i] = disc_bdaddr[i];
+                   HCI_Command(buf, 9);
+           }
+           break;
+
+   case EV_USER_PASSKEY_NOTIFICATION:
+           sspPasskey = (uint32_t)hcibuf[3] | ((uint32_t)hcibuf[4] << 8) |
+                        ((uint32_t)hcibuf[5] << 16) | ((uint32_t)hcibuf[6] << 24);
+   #ifdef DEBUG_USB_HOST
+           Notify(PSTR("\r\n>>> PASSKEY NOTIFICATION: "), 0x80);
+           USB_HOST_SERIAL.print(sspPasskey);
+   #endif
+           break;
+   ```
+
+   c) In `HCI_DISCONNECT_STATE` (around line 1093), add service reset and L2CAP flag cleanup so BTHID properly detects physical disconnects. **Replace the entire case body** with:
+   ```cpp
+   case HCI_DISCONNECT_STATE:
+           if(hci_check_flag(HCI_FLAG_DISCONNECT_COMPLETE)) {
+   #ifdef DEBUG_USB_HOST
+                   Notify(PSTR("\r\nHCI Disconnected from Device"), 0x80);
+   #endif
+                   // Reset all services (BTHID etc.) so connected flags become false
+                   for(uint8_t i = 0; i < BTD_NUM_SERVICES; i++)
+                           if(btService[i])
+                                   btService[i]->Reset();
+
+                   hci_event_flag = 0;
+                   memset(hcibuf, 0, BULK_MAXPKTSIZE);
+                   memset(l2capinbuf, 0, BULK_MAXPKTSIZE);
+
+                   connectToWii = incomingWii = pairWithWii = false;
+                   connectToHIDDevice = incomingHIDDevice = checkRemoteName = false;
+                   incomingPSController = false;
+
+                   l2capConnectionClaimed = false;
+                   sdpConnectionClaimed = false;
+                   rfcommConnectionClaimed = false;
+
+                   hci_state = HCI_SCANNING_STATE;
+           }
+           break;
+   ```
+
+   d) In `EV_INQUIRY_COMPLETE` handler (around line 488), prevent the library from giving up after 5 failed inquiries for HID devices — change the block to only give up for Wii, and keep retrying for HID:
+   ```cpp
+   case EV_INQUIRY_COMPLETE:
+           if(inquiry_counter >= 5 && pairWithWii) {
+                   inquiry_counter = 0;
+                   connectToWii = false;
+                   pairWithWii = false;
+                   hci_state = HCI_SCANNING_STATE;
+           }
+           if(inquiry_counter >= 5 && pairWithHIDDevice) {
+                   // Don't give up — reset counter and keep searching
+                   inquiry_counter = 0;
+           }
+           inquiry_counter++;
+           break;
+   ```
+
+7. **`BTD.h`** — make `hci_state` accessible from the sketch, and add link key storage (in the `private:` section, around line 587):
+   ```cpp
+   /* Variables used by high level HCI task */
+   public:
+           uint8_t hci_state; // Current state of Bluetooth HCI connection
+   private:
+   ```
+
+   Also add link key fields after `sspPasskey` (around line 493):
+   ```cpp
+   /** Stored link key for reconnection (set from EV_LINK_KEY_NOTIFICATION). */
+   uint8_t link_key[16];
+   /** BD_ADDR associated with stored link key. */
+   uint8_t link_key_bdaddr[6];
+   /** True if a valid link key is stored. */
+   bool link_key_valid;
+   ```
+
+   And add function declarations after `hci_link_key_request_negative_reply()`:
+   ```cpp
+   /** Reply to a Link Key Request with a stored link key. */
+   void hci_link_key_request_reply();
+   /** Enable encryption on an existing HCI connection (needed after link key auth). */
+   void hci_set_connection_encryption();
+   ```
+
+8. **`BTD.cpp`** — link key storage and reconnection support:
+
+   a) In the constructor (around line 41), initialize link key fields:
+   ```cpp
+   link_key_valid = false;
+   memset(link_key, 0, sizeof(link_key));
+   memset(link_key_bdaddr, 0, sizeof(link_key_bdaddr));
+   ```
+
+   b) Replace `EV_LINK_KEY_REQUEST` handler (around line 649) — reply with stored key when available:
+   ```cpp
+   case EV_LINK_KEY_REQUEST:
+           if(link_key_valid && memcmp(&hcibuf[2], link_key_bdaddr, 6) == 0) {
+                   hci_link_key_request_reply();
+           } else {
+                   hci_link_key_request_negative_reply();
+           }
+           break;
+   ```
+
+   c) Move `EV_LINK_KEY_NOTIFICATION` out of the ignored events list and add a handler to store the key:
+   ```cpp
+   case EV_LINK_KEY_NOTIFICATION:
+           for(uint8_t i = 0; i < 6; i++)
+                   link_key_bdaddr[i] = hcibuf[2 + i];
+           for(uint8_t i = 0; i < 16; i++)
+                   link_key[i] = hcibuf[8 + i];
+           link_key_valid = true;
+           break;
+   ```
+
+   d) Add `hci_link_key_request_reply()` and `hci_set_connection_encryption()` functions after `hci_link_key_request_negative_reply()`:
+   ```cpp
+   void BTD::hci_link_key_request_reply() {
+           hcibuf[0] = 0x0B; // HCI OCF = 0B
+           hcibuf[1] = 0x01 << 2; // HCI OGF = 1
+           hcibuf[2] = 0x16; // parameter length 22
+           hcibuf[3] = disc_bdaddr[0];
+           hcibuf[4] = disc_bdaddr[1];
+           hcibuf[5] = disc_bdaddr[2];
+           hcibuf[6] = disc_bdaddr[3];
+           hcibuf[7] = disc_bdaddr[4];
+           hcibuf[8] = disc_bdaddr[5];
+           for(uint8_t i = 0; i < 16; i++)
+                   hcibuf[9 + i] = link_key[i];
+           HCI_Command(hcibuf, 25);
+   }
+
+   void BTD::hci_set_connection_encryption() {
+           hcibuf[0] = 0x13; // HCI OCF = 0x13 (Set_Connection_Encryption)
+           hcibuf[1] = 0x01 << 2; // HCI OGF = 1 (Link Control)
+           hcibuf[2] = 0x03; // parameter length 3
+           hcibuf[3] = (uint8_t)(hci_handle & 0xFF);
+           hcibuf[4] = (uint8_t)((hci_handle >> 8) & 0x0F);
+           hcibuf[5] = 0x01; // Encryption_Enable = ON
+           HCI_Command(hcibuf, 6);
+   }
+   ```
+
+   e) In `EV_AUTHENTICATION_COMPLETE` handler, when reconnecting with stored link key, enable encryption and wait for `EV_ENCRYPTION_CHANGE` before starting L2CAP:
+   ```cpp
+   } else if(pairWithHIDDevice && !connectToHIDDevice) {
+           Notify(PSTR("\r\nPairing successful with HID device"), 0x80);
+           if(link_key_valid) {
+                   // Reconnect — enable encryption first, wait for EV_ENCRYPTION_CHANGE
+                   hci_set_connection_encryption();
+           } else {
+                   // First SSP pairing — controller handles encryption automatically
+                   connectToHIDDevice = true;
+           }
+   ```
+
+   f) Move `EV_ENCRYPTION_CHANGE` out of the ignored events list and add a handler — set `connectToHIDDevice` after encryption is established:
+   ```cpp
+   case EV_ENCRYPTION_CHANGE:
+           if(hcibuf[2] == 0x00) { // Status = success
+                   Notify(PSTR("\r\nEncryption enabled"), 0x80);
+                   if(pairWithHIDDevice && !connectToHIDDevice) {
+                           connectToHIDDevice = true;
+                   }
+           } else {
+                   Notify(PSTR("\r\nEncryption failed: "), 0x80);
+                   D_PrintHex<uint8_t>(hcibuf[2], 0x80);
+                   hci_disconnect(hci_handle);
+           }
+           break;
+   ```
+
+9. **`BTHID.h`** — make `setProtocol()` virtual so the sketch can override it (Apple keyboards break when SET_PROTOCOL is sent on reconnect). In the `private:` section (around line 171), change:
+   ```cpp
+   // WAS:  void setProtocol();
+   virtual void setProtocol();
+   ```
 
 ---
 
@@ -204,6 +468,7 @@ https://github.com/krll-kov/m5stack-wireless-kvm-switch/blob/main/ino_cores3se.i
 | **Security PIN prompt** | Some keyboards require entering a 6-digit PIN displayed on the CoreS3 screen. |
 | **First input delay after idle** | The device enters power-saving mode after inactivity (10 sec = 1ms delay, 1 minute = 20ms delay, 5 min = 50ms delay, 15 min = 100ms delay). The first mouse movement after wake may feel slightly delayed. |
 | **Mouse rate is not 1000Hz** | Read speed of your mouse is pure 1:1 from your mouse settings (as long as device is capable of this rate. I did not test it with mouse that has higher than 1000Hz, but it does support 1000Hz input!). But output works differently, you have to update MOUSE_SEND_HZ variable and set it a value that is higher than actual mouse rate, for example for my keychrone m3 mini i get 1000Hz ouput rate when i set MOUSE_SEND_HZ to 1750-2000 (this number is more like code delay between iterations) |
+| **Apple fn/Globe key** | The fn (globe) key on Apple Magic Keyboard is mapped to Right GUI modifier. On macOS you can remap it to switch input language via System Settings → Keyboard → Keyboard Shortcuts → Modifier Keys. If the mapping doesn't work, check serial output for `[HID] rpt=0x90` lines to debug. |
 | **Battery status does not update** | If you don't use debug mode, the only way to update the screen is to press mouse4 to switch pc or to plug-out/in mouse dongle, this is made for performance reasons. Also if you charge with battery base - we can't get the voltage and other info directly with code so we measure it by taking periodic battery samples |
 | **Screen goes black** | This is done because of power efficiency - screen is only displayed during setup/pc switch (10sec here), without it battery will drain faster than it's charing from battery bottom |
 
