@@ -20,6 +20,9 @@ void tud_connect(void);
 
 #define ESPNOW_CHAN 1
 
+// XOR key for keyboard payload obfuscation (must match CoreS3 SE)
+static const uint8_t KBD_XOR[7] = {0x4B,0x56,0x4D,0x53,0x77,0x31,0x7A};
+
 #define PKT_MOUSE 0x01
 #define PKT_KEYBOARD 0x02
 #define PKT_ACTIVATE 0x03
@@ -90,7 +93,7 @@ void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
       pendingDeactivate = true;
       break;
     case PKT_MOUSE:
-      if (len >= 7) {
+      if (len >= 7 && deviceActive) {
         MousePkt p;
         p.btn = data[1];
         p.dx = (int16_t)(data[2] | (data[3] << 8));
@@ -101,9 +104,11 @@ void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
       break;
     case PKT_KEYBOARD:
       if (len >= 8) {
+        uint8_t dec[7];
+        for (int i = 0; i < 7; i++) dec[i] = data[1 + i] ^ KBD_XOR[i];
         KbdPkt k;
-        k.mod = data[1];
-        memcpy(k.keys, &data[2], 6);
+        k.mod = dec[0];
+        memcpy(k.keys, &dec[1], 6);
         xQueueSend(kbdQ, &k, 0);
       }
       break;

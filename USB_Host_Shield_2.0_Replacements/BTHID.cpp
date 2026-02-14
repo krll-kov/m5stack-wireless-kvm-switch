@@ -373,7 +373,7 @@ void BTHID::ACLData(uint8_t* l2capinbuf) {
                                 Notify(PSTR(" "), 0x80);
                         }
 #endif
-                        if(l2capinbuf[8] == 0xA3) { // HID BT DATA (0xA0) | Report Type (Feature 0x03)
+                        if(l2capinbuf[8] == 0xA3 || l2capinbuf[8] == 0xA1) { // HID BT DATA: Feature (0xA3) or Input (0xA1)
                                 uint16_t length = ((uint16_t)l2capinbuf[5] << 8 | l2capinbuf[4]);
                                 ParseBTHIDControlData((uint8_t)(length - 1), &l2capinbuf[9]); // First byte will be the report ID
                         } else {

@@ -32,6 +32,9 @@
 uint8_t ATOM_MAC_1[] = {0x3C, 0xDC, 0x75, 0xED, 0xFB, 0x4C};
 uint8_t ATOM_MAC_2[] = {0xD0, 0xCF, 0x13, 0x0F, 0x90, 0x48};
 
+// XOR key for keyboard payload obfuscation (must match AtomS3U)
+static const uint8_t KBD_XOR[7] = {0x4B,0x56,0x4D,0x53,0x77,0x31,0x7A};
+
 #define BLE_KBD_MATCH "Keyboard"
 #define ESPNOW_CHAN 1
 // Real send speed will be 1000 with this number, it just has to be higher than
@@ -110,6 +113,7 @@ static volatile bool classicKbdKnown = false;  // remember classic BT was connec
 static volatile bool appleFnDown = false;       // Apple fn/globe key state
 static volatile bool appleRawFn = false;        // raw fn bit from keyboard byte 8
 static volatile bool appleRawLock = false;      // raw lock bit from keyboard byte 8
+static volatile int kbdBatteryPct = -1;         // keyboard battery % (-1 = unknown)
 
 RTC_NOINIT_ATTR char rtcDbg[48];
 static bool wasReboot = false;
@@ -291,6 +295,7 @@ static void switchTarget() {
   switchInProgress = false;
   needRedraw = true;
 }
+static const uint8_t broadcastMac[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 static void txMouse(const mouse_evt_t *m) {
   uint8_t p[7] = {PKT_MOUSE,
                   (uint8_t)(m->buttons & 0x07),
@@ -299,7 +304,7 @@ static void txMouse(const mouse_evt_t *m) {
                   (uint8_t)(m->y & 0xFF),
                   (uint8_t)((m->y >> 8) & 0xFF),
                   (uint8_t)m->wheel};
-  esp_now_send(activeMac(), p, 7);
+  esp_now_send(broadcastMac, p, 7);  // broadcast = no ACK wait
 #if DEBUG_MODE
   dbgEspTx++;
 #endif
@@ -307,6 +312,7 @@ static void txMouse(const mouse_evt_t *m) {
 static void txKbd(const kbd_evt_t *k) {
   uint8_t p[8] = {PKT_KEYBOARD, k->modifiers};
   memcpy(&p[2], k->keys, 6);
+  for (int i = 0; i < 7; i++) p[1 + i] ^= KBD_XOR[i];
   esp_now_send(activeMac(), p, 8);
 }
 
@@ -354,6 +360,16 @@ public:
 
     // Apple vendor report 0x90: fn/globe key — actual fn handled via byte 8, ignore here
     if (rptId == 0x90) return;
+
+    // Apple battery report 0xF0: sent periodically on interrupt channel
+    if (rptId == 0xF0 && len >= 4) {
+      int pct = buf[3];
+      if (pct >= 0 && pct <= 100 && pct != kbdBatteryPct) {
+        kbdBatteryPct = pct;
+        needRedraw = true;
+      }
+      return;
+    }
 
     // Forward all other reports as consumer keys (Apple consumer: media, etc.)
     if (len >= 3) {
@@ -409,6 +425,7 @@ void max3421Poll() {
     needRedraw = true;
   } else if (!connected && wasConnected) {
     mxClassicConnected = false;
+    kbdBatteryPct = -1;
     snprintf(maxStatusMsg, sizeof(maxStatusMsg), "classic disc");
     Serial.println("BTHID disconnected");
     // Force-clear L2CAP claim so reconnection can start fresh.
@@ -417,6 +434,8 @@ void max3421Poll() {
     needRedraw = true;
   }
   wasConnected = connected;
+
+  // Classic BT battery comes via interrupt channel (report 0xF0) — no polling needed
 
   // Track connecting state for UI (between inquiry and connected)
   static bool wasConnecting = false;
@@ -526,8 +545,13 @@ void max3421Poll() {
   }
 
 }
+static inline bool classicBtConnected() { return bthid.connected; }
+static inline const char *classicBtName() { return (const char *)Btd.remote_name; }
 #else
 static inline void max3421Poll() {}
+static inline bool classicBtConnected() { return false; }
+static inline const char *classicBtName() { return ""; }
+static volatile bool mxClassicConnected = false;
 #endif
 
 // ===================== USB MOUSE HOST =====================
@@ -1000,6 +1024,16 @@ static bool readGapName(NimBLEClient *c, char *out, size_t maxLen) {
   return true;
 }
 
+static int readBleBattery(NimBLEClient *c) {
+  if (!c || !c->isConnected()) return -1;
+  NimBLERemoteService *bas = c->getService(NimBLEUUID((uint16_t)0x180F));
+  if (!bas || !c->isConnected()) return -1;
+  NimBLERemoteCharacteristic *bl = bas->getCharacteristic(NimBLEUUID((uint16_t)0x2A19));
+  if (!bl || !bl->canRead() || !c->isConnected()) return -1;
+  uint8_t val = bl->readValue<uint8_t>();
+  return (val <= 100) ? (int)val : -1;
+}
+
 static inline void resetPairState() {
   passkeyActive = false;
   pairingDone = false;
@@ -1172,8 +1206,23 @@ static bool bleDoConnect() {
   bleState = 4;
   passkeyActive = false;
   usbResetRequest = true;
+  kbdBatteryPct = readBleBattery(c);
   needRedraw = true;
-  while (c->isConnected()) vTaskDelay(pdMS_TO_TICKS(500));
+  {
+    uint32_t lastBatMs = millis();
+    while (c->isConnected()) {
+      vTaskDelay(pdMS_TO_TICKS(500));
+      if (idleLevel() <= 2 && (millis() - lastBatMs >= 600000)) {
+        int bat = readBleBattery(c);
+        if (bat >= 0 && bat != kbdBatteryPct) {
+          kbdBatteryPct = bat;
+          needRedraw = true;
+        }
+        lastBatMs = millis();
+      }
+    }
+  }
+  kbdBatteryPct = -1;
   bleKbdConnected = false;
   bleState = 5;
   snprintf(bleStatusMsg, sizeof(bleStatusMsg), "disconnected");
@@ -1184,13 +1233,14 @@ static bool bleDoConnect() {
 }
 
 void bleTask(void *) {
+  bool nimbleOff = false;
   NimBLEDevice::init("CoreS3-KVM");
   setKbdSecMode();
   NimBLEScan *scan = NimBLEDevice::getScan();
   scan->setScanCallbacks(&scanCbInstance, true);
   scan->setActiveScan(true);
   scan->setInterval(200);
-  scan->setWindow(50);
+  scan->setWindow(25);  // 15.6ms out of 125ms = 12.5% radio duty — less mouse lag during scan
 
 #if USE_MAX_MODULE
   // Brief wait for MAX3421E dongle init (non-blocking, just a few seconds)
@@ -1205,16 +1255,24 @@ void bleTask(void *) {
 
   while (true) {
     // ── 1. Classic BT currently connected → stay until disconnect ──
-    if (bthid.connected && !bleKbdConnected) {
+    if (classicBtConnected() && !bleKbdConnected) {
       classicKbdKnown = true;
       appleFnDown = false;
       bleKbdConnected = true;
+      kbdBatteryPct = -1;  // will be filled by requestBattery() in max3421Poll
       snprintf(bleFoundName, sizeof(bleFoundName), "Classic HID");
-      if (Btd.remote_name[0])
-        strncpy(bleFoundName, (const char *)Btd.remote_name, sizeof(bleFoundName) - 1);
+      if (classicBtName()[0])
+        strncpy(bleFoundName, classicBtName(), sizeof(bleFoundName) - 1);
       bleState = 4;
       needRedraw = true;
-      while (bthid.connected) vTaskDelay(pdMS_TO_TICKS(500));
+      // Classic BT goes through MAX3421E (SPI), not ESP32 radio.
+      // Deinit NimBLE to fully free the radio for ESP-NOW mouse data.
+      if (!nimbleOff) {
+        NimBLEDevice::deinit(true);
+        nimbleOff = true;
+      }
+      while (classicBtConnected()) vTaskDelay(pdMS_TO_TICKS(500));
+      kbdBatteryPct = -1;
       bleKbdConnected = false;
       appleFnDown = false;
       bleState = 5;
@@ -1229,13 +1287,13 @@ void bleTask(void *) {
       bleState = 5;
       snprintf(bleStatusMsg, sizeof(bleStatusMsg), "BT reconnect...");
       needRedraw = true;
-      while (!bthid.connected) vTaskDelay(pdMS_TO_TICKS(500));
+      while (!classicBtConnected()) vTaskDelay(pdMS_TO_TICKS(500));
       continue;  // reconnected → #1 handles it
     }
 
     // ── 3. BLE keyboard known → reconnect forever ──
     if (knownKbdValid && !bleKbdConnected) {
-      if (bthid.connected) continue;  // classic connected meanwhile → #1
+      if (classicBtConnected()) continue;  // classic connected meanwhile → #1
       bleFound = true;
       bleAddr = knownKbdAddr;
       if (bleFoundName[0] == '\0')
@@ -1255,7 +1313,7 @@ void bleTask(void *) {
       bleState = 7;
       snprintf(bleStatusMsg, sizeof(bleStatusMsg), "mouse-only");
       needRedraw = true;
-      while (!knownKbdValid && !bthid.connected) vTaskDelay(pdMS_TO_TICKS(1000));
+      while (!knownKbdValid && !classicBtConnected()) vTaskDelay(pdMS_TO_TICKS(1000));
       continue;
     }
 
@@ -1270,26 +1328,26 @@ void bleTask(void *) {
     needRedraw = true;
 
     uint32_t budgetStart = millis();
-    while (!bleFound && !bthid.connected && (millis() - budgetStart < BLE_SCAN_BUDGET_MS)) {
+    while (!bleFound && !classicBtConnected() && (millis() - budgetStart < BLE_SCAN_BUDGET_MS)) {
       bleScanDone = false;
       if (!scan->start(0, false)) {
         vTaskDelay(pdMS_TO_TICKS(500));
         continue;
       }
       uint32_t burstEnd = millis() + BLE_SCAN_BURST_MS;
-      while (!bleScanDone && !bleFound && !bthid.connected && millis() < burstEnd &&
+      while (!bleScanDone && !bleFound && !classicBtConnected() && millis() < burstEnd &&
              (millis() - budgetStart < BLE_SCAN_BUDGET_MS))
         vTaskDelay(pdMS_TO_TICKS(50));
       scan->stop();
-      if (bleFound || bthid.connected) break;
+      if (bleFound || classicBtConnected()) break;
       vTaskDelay(pdMS_TO_TICKS(BLE_SCAN_GAP_MS));
     }
     scan->stop();
 
     // Classic connected during scan — go handle it at top of loop
-    if (bthid.connected) continue;
+    if (classicBtConnected()) continue;
 
-    if (bleFound && !bthid.connected) {
+    if (bleFound && !classicBtConnected()) {
       setKbdSecMode();
       bool ok = bleDoConnect();
       if (!ok && !knownKbdValid) {
@@ -1299,7 +1357,7 @@ void bleTask(void *) {
       if (!knownKbdValid) vTaskDelay(pdMS_TO_TICKS(2000));
       continue;
     }
-    if (bthid.connected) continue;
+    if (classicBtConnected()) continue;
 
     // ── Unified probe list: classic + BLE sorted by RSSI ──
     int sorted[SEEN_DEV_MAX], sortedN = getTopByRssi(sorted, SEEN_DEV_MAX);
@@ -1314,13 +1372,13 @@ void bleTask(void *) {
       seenDevs[i].probeTarget = true;
     }
 
-    if (probeCnt > 0 && !bleFound && !bthid.connected) {
+    if (probeCnt > 0 && !bleFound && !classicBtConnected()) {
       strncpy(rtcDbg, "probe-start", sizeof(rtcDbg));
       if (!pc) {
         pc = NimBLEDevice::createClient();
         if (pc) pc->setClientCallbacks(&secCb);
       }
-      for (int p = 0; p < probeCnt && !bleFound && !bthid.connected; p++) {
+      for (int p = 0; p < probeCnt && !bleFound && !classicBtConnected(); p++) {
         int si = probeList[p];
         if (si < 0 || si >= SEEN_DEV_MAX || !seenDevs[si].used) continue;
         seen_dev_t &d = seenDevs[si];
@@ -1359,7 +1417,7 @@ void bleTask(void *) {
     setKbdSecMode();
     strncpy(rtcDbg, "post-setKbdSec", sizeof(rtcDbg));
 
-    if (bthid.connected) continue;
+    if (classicBtConnected()) continue;
 
     if (bleFound) {
       strncpy(rtcDbg, "final-connect", sizeof(rtcDbg));
@@ -1637,6 +1695,20 @@ static void drawUI() {
     d.setCursor(14, yM + 6);
     d.setTextColor(GREEN);
     d.print("CONNECTED");
+    // Keyboard battery (BLE only)
+    int kBat = kbdBatteryPct;
+    if (kBat >= 0) {
+      uint16_t bc = kBat > 20 ? GREEN : (kBat > 10 ? YELLOW : RED);
+      int bx = 252;
+      d.drawRect(bx, yM + 8, 18, 10, bc);
+      d.fillRect(bx + 18, yM + 11, 2, 4, bc);
+      int bf = (kBat * 14) / 100;
+      if (bf > 0) d.fillRect(bx + 2, yM + 10, bf, 6, bc);
+      d.setTextSize(1);
+      d.setCursor(bx + 24, yM + 9);
+      d.setTextColor(bc);
+      d.printf("%d%%", kBat);
+    }
     d.setTextSize(1);
     d.setCursor(14, yM + 24);
     d.setTextColor(WHITE);
@@ -1929,6 +2001,15 @@ void setup() {
   peer2.encrypt = false;
   peer2.ifidx = WIFI_IF_STA;
   esp_now_add_peer(&peer2);
+  // Broadcast peer for mouse data (no ACK wait)
+  {
+    esp_now_peer_info_t bp = {};
+    memset(bp.peer_addr, 0xFF, 6);
+    bp.channel = ESPNOW_CHAN;
+    bp.encrypt = false;
+    bp.ifidx = WIFI_IF_STA;
+    esp_now_add_peer(&bp);
+  }
   sendCmd(ATOM_MAC_1, PKT_ACTIVATE);
   sendCmd(ATOM_MAC_2, PKT_DEACTIVATE);
 

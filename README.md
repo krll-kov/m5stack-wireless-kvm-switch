@@ -359,6 +359,12 @@ After installing the library, modify these files in your Arduino libraries folde
     CP_MASK_COMPARE_PROTOCOL > CdcControlParser(this);
     ```
 
+10. **`BTHID.cpp`** — also handle Input report responses (0xA1) on the L2CAP control channel, not just Feature (0xA3). Around line 376, change:
+    ```cpp
+    // WAS:  if(l2capinbuf[8] == 0xA3) {
+    if(l2capinbuf[8] == 0xA3 || l2capinbuf[8] == 0xA1) {
+    ```
+
 ---
 
 ## 🔍 Step 1 — Get MAC Addresses of Both Atom S3U
@@ -437,12 +443,15 @@ Before uploading, **update these values** in the sketch:
 |---|---|---|
 | `ATOM_MAC_1[]` | MAC of first Atom S3U | `{0x3C, 0xDC, 0x75, 0xED, 0xFB, 0x4C}` |
 | `ATOM_MAC_2[]` | MAC of second Atom S3U | `{0xD0, 0xCF, 0x13, 0x0F, 0x90, 0x48}` |
+| `KBD_XOR[7]` | **Must change!** XOR key for keyboard obfuscation (same in both sketches) | `{0x4B,0x56,0x4D,0x53,0x77,0x31,0x7A}` |
 | `BLE_KBD_MATCH` | Part of your keyboard's BT name (no special chars) | `"Keyboard"` |
 | `MOUSE_SEND_HZ` | Set higher than actual mouse input rate to get real number, for example if mouse is 1000, set this to 2100 and you'll get real 1000 (you can verify number with debug mode), it's just how delay works in programming | `2100` |
 | `USE_MAX_MODULE` | Set `true` if using the classic USB module | `false` |
 | `WITH_KEYBOARD` | Set `false` for mouse-only mode | `true` |
 | `BLE_PROBE_MIN_RSSI` | Raise to `-80` if keyboard is far away | `-55` |
 | `DEBUG_MODE` | Set to true to see debug mode stats, usefull for MOUSE_SEND_HZ measuring | `false` |
+
+> **Security:** Keyboard data is XOR-obfuscated over the air to prevent casual sniffing of keystrokes. Mouse data is sent as unencrypted broadcast for maximum performance. **Change the default `KBD_XOR` key to your own random 7 bytes in both `ino_cores3se.ino` and `ino_atoms3u.ino` — the values must match.**
 
 > 💡 The switch button is bound to **Mouse4** (`m.buttons & 0x08`) by default.
 
