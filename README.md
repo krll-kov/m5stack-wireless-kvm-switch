@@ -107,18 +107,22 @@ This selects **SS2** (G5 → remapped to G1 in software) and **INT1** (G35 → r
 
 ### USB Host Shield 2.0 — Pin Modifications for CoreS3 SE
 
-After installing the library, modify these 6 files in your Arduino libraries folder (typically `~/Documents/Arduino/libraries/USB_Host_Shield_Library_2.0/`):
+After installing the library, modify these files in your Arduino libraries folder (typically `~/Documents/Arduino/libraries/USB_Host_Shield_Library_2.0/`):
 
-**Pin configuration (4 files):**
+> **Quick way:** Instead of editing files manually, copy all files from the [`USB_Host_Shield_2.0_Replacements/`](USB_Host_Shield_2.0_Replacements/) folder in this repo and replace the corresponding files in your library folder.
 
-1. **`avrpins.h`** — add after the line `MAKE_PIN(P17, 17);` (in the ESP32 section):
+> **Note:** The upstream library (v1.7.0) already has an `ARDUINO_M5STACK_CORES3` section in `avrpins.h`, `usbhost.h`, and `UsbCore.h`, but it uses INT=P14 which doesn't match our wiring (INT=GPIO10). Remove those `#elif defined(ARDUINO_M5STACK_CORES3)` blocks and apply the changes below to the generic `#elif defined(ESP32)` section instead.
+
+**Pin configuration (3 files):**
+
+1. **`avrpins.h`** — remove the `ARDUINO_M5STACK_CORES3` block, then add after `MAKE_PIN(P17, 17);` (in the generic ESP32 section):
    ```cpp
    MAKE_PIN(P35, 35);
    MAKE_PIN(P36, 36);
    MAKE_PIN(P37, 37);
    ```
 
-2. **`usbhost.h`** — change the ESP32 `spi` typedef:
+2. **`usbhost.h`** — remove the `ARDUINO_M5STACK_CORES3` spi typedef, then change the generic ESP32 `spi` typedef:
    ```cpp
    typedef SPi< P36, P37, P35, P1 > spi;  // SCK=36, MOSI=37, MISO=35, SS=1(CS)
    ```
@@ -131,19 +135,14 @@ After installing the library, modify these 6 files in your Arduino libraries fol
    #endif
    ```
 
-3. **`UsbCore.h`** — change the ESP32 `MAX3421E` typedef:
+3. **`UsbCore.h`** — remove the `ARDUINO_M5STACK_CORES3` typedef, then change the generic ESP32 `MAX3421E` typedef:
    ```cpp
    typedef MAX3421e<P1, P10> MAX3421E;  // SS=GPIO1(CS), INT=GPIO10
    ```
 
-4. **`settings.h`** — enable debug output (optional):
-   ```cpp
-   #define ENABLE_UHS_DEBUGGING 1
-   ```
-
 **SSP (Secure Simple Pairing) for Apple keyboards (2 files):**
 
-5. **`BTD.h`** — add two event defines (after the existing `EV_` defines, around line 110):
+4. **`BTD.h`** — add two event defines (after the existing `EV_` defines, around line 110):
    ```cpp
    #define EV_USER_PASSKEY_REQUEST                         0x34
    #define EV_USER_PASSKEY_NOTIFICATION                    0x3B
@@ -154,7 +153,7 @@ After installing the library, modify these 6 files in your Arduino libraries fol
    uint32_t sspPasskey;
    ```
 
-6. **`BTD.cpp`** — three changes:
+5. **`BTD.cpp`** — three changes:
 
    a) In `hci_io_capability_request_reply()` (around line 1401), change IO capability from `0x03` (NoInputNoOutput) to `0x01` (DisplayOnly) and auth requirement to `0x04` (MITM Required):
    ```cpp
@@ -233,7 +232,7 @@ After installing the library, modify these 6 files in your Arduino libraries fol
            break;
    ```
 
-7. **`BTD.h`** — make `hci_state` accessible from the sketch, and add link key storage (in the `private:` section, around line 587):
+6. **`BTD.h`** — make `hci_state` accessible from the sketch, and add link key storage (in the `private:` section, around line 587):
    ```cpp
    /* Variables used by high level HCI task */
    public:
@@ -259,7 +258,7 @@ After installing the library, modify these 6 files in your Arduino libraries fol
    void hci_set_connection_encryption();
    ```
 
-8. **`BTD.cpp`** — link key storage and reconnection support:
+7. **`BTD.cpp`** — link key storage and reconnection support:
 
    a) In the constructor (around line 41), initialize link key fields:
    ```cpp
@@ -347,11 +346,18 @@ After installing the library, modify these 6 files in your Arduino libraries fol
            break;
    ```
 
-9. **`BTHID.h`** — make `setProtocol()` virtual so the sketch can override it (Apple keyboards break when SET_PROTOCOL is sent on reconnect). In the `private:` section (around line 171), change:
+8. **`BTHID.h`** — make `setProtocol()` virtual so the sketch can override it (Apple keyboards break when SET_PROTOCOL is sent on reconnect). In the `private:` section (around line 171), change:
    ```cpp
    // WAS:  void setProtocol();
    virtual void setProtocol();
    ```
+
+9. **`cdcacm.cpp`** — add protocol comparison flag to CDC control parser (around line 139). This fixes enumeration of BT dongles with non-standard CDC protocol values:
+    ```cpp
+    // WAS:  CP_MASK_COMPARE_SUBCLASS > CdcControlParser(this);
+    CP_MASK_COMPARE_SUBCLASS |
+    CP_MASK_COMPARE_PROTOCOL > CdcControlParser(this);
+    ```
 
 ---
 
@@ -468,7 +474,7 @@ https://github.com/krll-kov/m5stack-wireless-kvm-switch/blob/main/ino_cores3se.i
 | **Security PIN prompt** | Some keyboards require entering a 6-digit PIN displayed on the CoreS3 screen. |
 | **First input delay after idle** | The device enters power-saving mode after inactivity (10 sec = 1ms delay, 1 minute = 20ms delay, 5 min = 50ms delay, 15 min = 100ms delay). The first mouse movement after wake may feel slightly delayed. |
 | **Mouse rate is not 1000Hz** | Read speed of your mouse is pure 1:1 from your mouse settings (as long as device is capable of this rate. I did not test it with mouse that has higher than 1000Hz, but it does support 1000Hz input!). But output works differently, you have to update MOUSE_SEND_HZ variable and set it a value that is higher than actual mouse rate, for example for my keychrone m3 mini i get 1000Hz ouput rate when i set MOUSE_SEND_HZ to 1750-2000 (this number is more like code delay between iterations) |
-| **Apple fn/Globe key** | The fn (globe) key on Apple Magic Keyboard is mapped to Right GUI modifier. On macOS you can remap it to switch input language via System Settings → Keyboard → Keyboard Shortcuts → Modifier Keys. If the mapping doesn't work, check serial output for `[HID] rpt=0x90` lines to debug. |
+| **Apple fn/Globe key — dictation popup** | The fn (Globe) key is forwarded as a consumer control key (usage 0x029D). A quick tap while typing may trigger the macOS "Enable Dictation?" dialog. To fix: go to **System Settings → Keyboard → Dictation** and turn it off, or change **"Press fn key to"** to "Change Input Source". You also have to select "Start Dictation - Press twice" and in bottom section change the shortcut to microphone, then switch back to "Change Input Source" |
 | **Battery status does not update** | If you don't use debug mode, the only way to update the screen is to press mouse4 to switch pc or to plug-out/in mouse dongle, this is made for performance reasons. Also if you charge with battery base - we can't get the voltage and other info directly with code so we measure it by taking periodic battery samples |
 | **Screen goes black** | This is done because of power efficiency - screen is only displayed during setup/pc switch (10sec here), without it battery will drain faster than it's charing from battery bottom |
 
