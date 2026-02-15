@@ -503,8 +503,8 @@ The AtomS3U uses the ESP32-S3 DWC2 USB controller, which has a hardware quirk: t
 **On Linux** you need to keep the CDC port open. Create a systemd service on each Linux PC where an AtomS3U is plugged in:
 
 ```bash
-# 1. Find your device (should show something like "303a:8211 Espressif")
-lsusb | grep -i espressif
+# 1. Find your device
+lsusb | grep -i "m5stack\|espressif\|atoms3"
 
 # 2. Create the service
 sudo tee /etc/systemd/system/kvm-cdc.service << 'EOF'
