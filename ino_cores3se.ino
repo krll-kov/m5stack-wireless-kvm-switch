@@ -319,22 +319,84 @@ static void txKbd(const kbd_evt_t *k) {
 // ===================== USB Host Shield 2.0 — BTHID =====================
 #if USE_MAX_MODULE
 
+// Apple F-key → consumer usage mapping (when fn NOT pressed)
+// 0 = no consumer mapping (pass through as F-key or handle as shortcut)
+#define APPLE_FKEY_FIRST 0x3A  // F1
+#define APPLE_FKEY_LAST  0x45  // F12
+#define FKEY_IS_SHORTCUT 0xFFFF  // sentinel: handle as keyboard shortcut
+
+static const uint16_t appleFkeyMap[12] = {
+  0x0070,           // F1  → Brightness Decrement
+  0x006F,           // F2  → Brightness Increment
+  FKEY_IS_SHORTCUT, // F3  → Mission Control (Ctrl+Up shortcut)
+  0x0221,           // F4  → AC Search (Spotlight)
+  0x00CF,           // F5  → Voice Command (Dictation)
+  0,                // F6  → DND (pass through as F6 — no standard usage)
+  0x00B6,           // F7  → Scan Previous Track
+  0x00CD,           // F8  → Play/Pause
+  0x00B5,           // F9  → Scan Next Track
+  0x00E2,           // F10 → Mute
+  0x00EA,           // F11 → Volume Decrement
+  0x00E9,           // F12 → Volume Increment
+};
+
+static uint16_t activeFkeyConsumer = 0;     // currently-held consumer usage from F-key
+static volatile bool appleF3Request = false; // flag for Mission Control shortcut
+
 class KvmKbdParser : public HIDReportParser {
 public:
   void Parse(USBHID *hid, bool is_rpt_id, uint8_t len, uint8_t *buf) override {
     if (len < 8) return;
+
+    // Apple: extract fn state from byte 8 FIRST
+    bool isApple = (len >= 9);
+    bool fnHeld = false;
+    if (isApple) {
+      appleRawFn = (buf[8] & 0x02) != 0;
+      appleRawLock = (buf[8] & 0x08) != 0;
+      fnHeld = appleRawFn;
+    }
+
     kbd_evt_t evt;
     evt.modifiers = buf[0];
     memcpy(evt.keys, &buf[2], 6);
+
+    // Apple F-key → consumer remap ONLY when fn (globe) is NOT held.
+    // When fn IS held: F1-F12 pass through as standard function keys.
+    uint16_t newConsumer = 0;
+    if (isApple && !fnHeld) {
+      for (int i = 0; i < 6; i++) {
+        uint8_t k = evt.keys[i];
+        if (k >= APPLE_FKEY_FIRST && k <= APPLE_FKEY_LAST) {
+          uint16_t usage = appleFkeyMap[k - APPLE_FKEY_FIRST];
+          if (usage == FKEY_IS_SHORTCUT) {
+            // F3 → Mission Control: flag for post-processing, remove from report
+            appleF3Request = true;
+            evt.keys[i] = 0;
+          } else if (usage != 0) {
+            newConsumer = usage;
+            evt.keys[i] = 0;  // remove F-key from keyboard report
+          }
+          // usage == 0: leave key as-is (F6 passes through as F6)
+        }
+      }
+    }
+
+    // Consumer press/release tracking
+    if (newConsumer != activeFkeyConsumer) {
+      if (activeFkeyConsumer != 0) {
+        uint8_t rel[3] = {PKT_CONSUMER, 0x00, 0x00};
+        esp_now_send(activeMac(), rel, 3);
+      }
+      if (newConsumer != 0) {
+        uint8_t p[3] = {PKT_CONSUMER, (uint8_t)(newConsumer & 0xFF), (uint8_t)(newConsumer >> 8)};
+        esp_now_send(activeMac(), p, 3);
+      }
+      activeFkeyConsumer = newConsumer;
+    }
+
     xQueueSend(kbdQueue, &evt, 0);
     lastActivityMs = millis();
-
-    // Apple Magic Keyboard sends 9-byte reports: [mod][res][k1..k6][apple]
-    // byte 8 bit 1 (0x02) = fn/globe, bit 3 (0x08) = lock
-    if (len >= 9) {
-      appleRawFn = (buf[8] & 0x02) != 0;
-      appleRawLock = (buf[8] & 0x08) != 0;
-    }
   }
 };
 
@@ -372,6 +434,7 @@ public:
     }
 
     // Forward all other reports as consumer keys (Apple consumer: media, etc.)
+    Serial.printf("BT rpt 0x%02X len=%d: %02X %02X\n", rptId, len, buf[1], len >= 3 ? buf[2] : 0);
     if (len >= 3) {
       uint16_t usage = (uint16_t)buf[1] | ((uint16_t)buf[2] << 8);
       uint8_t p[3] = {PKT_CONSUMER, (uint8_t)(usage & 0xFF), (uint8_t)(usage >> 8)};
@@ -542,6 +605,18 @@ void max3421Poll() {
         esp_now_send(activeMac(), p, 3);
       }
     }
+  }
+
+  // F3 → Mission Control: Ctrl + Up Arrow
+  if (appleF3Request) {
+    appleF3Request = false;
+    kbd_evt_t mc = {};
+    mc.modifiers = 0x01;  // LCtrl
+    mc.keys[0] = 0x52;    // Up Arrow
+    txKbd(&mc);
+    delay(30);
+    kbd_evt_t rel = {};
+    txKbd(&rel);
   }
 
 }
@@ -2127,6 +2202,7 @@ void loop() {
   }
 
   if (idlelvl != lastIdleLevel) {
+      int prevIdle = lastIdleLevel;
       lastIdleLevel = idlelvl;
       if (idlelvl >= 3) {
         wifiNeedsBackToNormal = true;
@@ -2134,8 +2210,17 @@ void loop() {
         esp_wifi_set_max_tx_power(40);
       } else if (wifiNeedsBackToNormal) {
         esp_wifi_set_ps(WIFI_PS_NONE);
-        esp_wifi_set_max_tx_power(80); 
+        esp_wifi_set_max_tx_power(80);
         wifiNeedsBackToNormal = false;
+        // Waking from deep idle — burst-send PKT_ACTIVATE so target recovers fast
+        if (prevIdle >= 3) {
+          delay(5);  // let WiFi stabilize
+          for (int i = 0; i < 3; i++) {
+            sendCmd(activeMac(), PKT_ACTIVATE);
+            delay(2);
+          }
+          lastBeat = millis();
+        }
       }
   }
 

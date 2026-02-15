@@ -77,6 +77,11 @@ volatile bool pendingActivate = false;
 volatile bool pendingDeactivate = false;
 static uint8_t prevBtn = 0;
 
+// Sleep/wake state tracking
+static bool wasSuspended = false;
+static bool wasActiveBeforeSuspend = false;
+volatile bool hostSuspended = false;
+
 // ── Health state ──
 static uint32_t bootMs = 0;
 volatile uint32_t lastPacketMs = 0;
@@ -143,6 +148,16 @@ void usbTask(void *pvParameters) {
   HIDMouseReport rpt;
 
   while (true) {
+    // While Mac is sleeping, discard all queued events to prevent waking it
+    if (hostSuspended) {
+      xQueueReset(mouseQ);
+      xQueueReset(kbdQ);
+      pendingActivate = false;
+      pendingDeactivate = false;
+      vTaskDelay(pdMS_TO_TICKS(100));
+      continue;
+    }
+
     if (pendingDeactivate) {
       pendingDeactivate = false;
       if (deviceActive) {
@@ -260,6 +275,15 @@ void loop() {
 
   // ── USB host gone (port powered off) ──
   if (!mounted && !suspended && !grace) {
+    // If we were suspended (Mac sleeping), this is a USB resume transition,
+    // not a true "USB gone" — use a shorter delay and skip replug timer.
+    if (wasSuspended) {
+      lastPacketMs = now;
+      delay(50);
+      return;
+    }
+
+    hostSuspended = false;
     if (deviceActive) {
       deviceActive = false;
       xQueueReset(mouseQ);
@@ -282,6 +306,11 @@ void loop() {
 
   // ── USB host suspended (Mac sleeping) ──
   if (suspended) {
+    hostSuspended = true;
+    if (!wasSuspended) {
+      wasActiveBeforeSuspend = deviceActive;
+      wasSuspended = true;
+    }
     if (deviceActive) {
       deviceActive = false;
       xQueueReset(mouseQ);
@@ -294,7 +323,18 @@ void loop() {
   }
 
   // ── Normal operation: mounted == true ──
+  hostSuspended = false;
   usbGoneSinceMs = 0;
+
+  // Just resumed from suspend — restore active state immediately
+  if (wasSuspended) {
+    wasSuspended = false;
+    if (wasActiveBeforeSuspend) {
+      deviceActive = true;
+      lastInputMs = millis();
+    }
+    wasActiveBeforeSuspend = false;
+  }
 
   if (!grace && (now - lastPacketMs > ESPNOW_TIMEOUT_MS)) {
     deviceActive = false;
