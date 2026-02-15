@@ -403,7 +403,13 @@ Now **swap to the second Atom S3U** and repeat. Save both MAC addresses.
 
 ## ⚡ Step 2 — Flash the Atom S3U Receiver Firmware
 
-> ⚠️ **Important:** Before uploading, change **USB Mode** AND **USB UPLOAD MODE** to **USB-OTG (TinyUSB)**. (BOTH!)
+> ⚠️ **Important:** Before uploading, set these Arduino IDE options:
+>
+> | Setting | Value |
+> |---|---|
+> | **USB Mode** | USB-OTG (TinyUSB) |
+> | **USB Upload Mode** | USB-OTG (TinyUSB) |
+> | **USB CDC On Boot** | **Enabled** (required — see [Linux setup](#-linux-host-setup-required) below) |
 
 <img width="848" alt="USB-OTG mode" src="https://github.com/user-attachments/assets/f418d42b-d1da-4661-996c-152d55c2fdb7" />
 
@@ -445,11 +451,10 @@ Before uploading, **update these values** in the sketch:
 | `ATOM_MAC_2[]` | MAC of second Atom S3U | `{0xD0, 0xCF, 0x13, 0x0F, 0x90, 0x48}` |
 | `KBD_XOR[7]` | **Must change!** XOR key for keyboard obfuscation (same in both sketches) | `{0x4B,0x56,0x4D,0x53,0x77,0x31,0x7A}` |
 | `BLE_KBD_MATCH` | Part of your keyboard's BT name (no special chars) | `"Keyboard"` |
-| `MOUSE_SEND_HZ` | Set higher than actual mouse input rate to get real number, for example if mouse is 1000, set this to 2100 and you'll get real 1000 (you can verify number with debug mode), it's just how delay works in programming | `2100` |
 | `USE_MAX_MODULE` | Set `true` if using the classic USB module | `false` |
 | `WITH_KEYBOARD` | Set `false` for mouse-only mode | `true` |
 | `BLE_PROBE_MIN_RSSI` | Raise to `-80` if keyboard is far away | `-55` |
-| `DEBUG_MODE` | Set to true to see debug mode stats, usefull for MOUSE_SEND_HZ measuring | `false` |
+| `DEBUG_MODE` | Set to true to see debug mode stats (USB poll rate, ESP-NOW send rate, queue depth) | `false` |
 
 > **Security:** Keyboard data is XOR-obfuscated over the air to prevent casual sniffing of keystrokes. Mouse data is sent as unencrypted broadcast for maximum performance. **Change the default `KBD_XOR` key to your own random 7 bytes in both `ino_cores3se.ino` and `ino_atoms3u.ino` — the values must match.**
 
@@ -482,10 +487,50 @@ https://github.com/krll-kov/m5stack-wireless-kvm-switch/blob/main/ino_cores3se.i
 | **Mouse lag during BT scan** | The device has a single radio module shared between ESP-NOW (mouse) and BLE (keyboard). Lag stops once keyboard pairing completes. |
 | **Security PIN prompt** | Some keyboards require entering a 6-digit PIN displayed on the CoreS3 screen. |
 | **First input delay after idle** | The device enters power-saving mode after inactivity (10 sec = 1ms delay, 1 minute = 20ms delay, 5 min = 50ms delay, 15 min = 100ms delay). The first mouse movement after wake may feel slightly delayed. |
-| **Mouse rate is not 1000Hz** | Read speed of your mouse is pure 1:1 from your mouse settings (as long as device is capable of this rate. I did not test it with mouse that has higher than 1000Hz, but it does support 1000Hz input!). But output works differently, you have to update MOUSE_SEND_HZ variable and set it a value that is higher than actual mouse rate, for example for my keychrone m3 mini i get 1000Hz ouput rate when i set MOUSE_SEND_HZ to 1750-2000 (this number is more like code delay between iterations) |
+| **Mouse rate** | Mouse events are forwarded 1:1 at the native poll rate of your mouse (tested up to 1000Hz). ESP-NOW uses 6.5 Mbps HT20 PHY for sufficient wireless throughput, and the AtomS3U uses non-blocking USB sends to avoid frame-alignment bottlenecks. On Linux, the CDC serial port must be kept open for full speed — see [Linux setup](#-linux-host-setup-required). |
 | **Apple fn/Globe key — dictation popup** | The fn (Globe) key is forwarded as a consumer control key (usage 0x029D). A quick tap while typing may trigger the macOS "Enable Dictation?" dialog. To fix: go to **System Settings → Keyboard → Dictation** and turn it off, or change **"Press fn key to"** to "Change Input Source". You also have to select "Start Dictation - Press twice" and in bottom section change the shortcut to microphone, then switch back to "Change Input Source" |
 | **Battery status does not update** | If you don't use debug mode, the only way to update the screen is to press mouse4 to switch pc or to plug-out/in mouse dongle, this is made for performance reasons. Also if you charge with battery base - we can't get the voltage and other info directly with code so we measure it by taking periodic battery samples |
 | **Screen goes black** | This is done because of power efficiency - screen is only displayed during setup/pc switch (10sec here), without it battery will drain faster than it's charing from battery bottom |
+
+---
+
+## 🐧 Linux Host Setup (Required)
+
+The AtomS3U uses the ESP32-S3 DWC2 USB controller, which has a hardware quirk: the HID endpoint (mouse/keyboard) only runs at full speed (~1000 Hz) when the CDC serial endpoint is actively polled by the host. Without this, mouse rate drops to ~500 Hz.
+
+**On macOS and Windows** this happens automatically — the OS keeps CDC endpoints active.
+
+**On Linux** you need to keep the CDC port open. Create a systemd service on each Linux PC where an AtomS3U is plugged in:
+
+```bash
+# 1. Find your device (should show something like "303a:8211 Espressif")
+lsusb | grep -i espressif
+
+# 2. Create the service
+sudo tee /etc/systemd/system/kvm-cdc.service << 'EOF'
+[Unit]
+Description=Keep KVM CDC port active for HID performance
+After=dev-ttyACM0.device
+BindsTo=dev-ttyACM0.device
+
+[Service]
+ExecStart=/bin/bash -c '/bin/cat /dev/ttyACM0 > /dev/null'
+Restart=always
+RestartSec=1
+
+[Install]
+WantedBy=dev-ttyACM0.device
+EOF
+
+# 3. Enable and start
+sudo systemctl daemon-reload
+sudo systemctl enable kvm-cdc.service
+sudo systemctl start kvm-cdc.service
+```
+
+> If your device appears as `/dev/ttyACM1` instead of `ttyACM0`, replace both occurrences in the service file.
+>
+> To verify it's working, check `systemctl status kvm-cdc.service` — it should show "active (running)".
 
 ---
 

@@ -7,15 +7,25 @@
 #include "USBHIDKeyboard.h"
 #include "USBHIDMouse.h"
 #include "USBHIDConsumerControl.h"
+#include "USBCDC.h"
 #include "freertos/queue.h"
 
-// ── TinyUSB health-check functions (always linked when USB-OTG mode) ──
+#define DEBUG_MODE false
+
+// ── TinyUSB functions (always linked when USB-OTG mode) ──
 extern "C" {
 bool tud_mounted(void);
 bool tud_suspended(void);
 bool tud_remote_wakeup(void);
 void tud_disconnect(void);
 void tud_connect(void);
+bool tud_hid_n_ready(uint8_t instance);
+bool tud_hid_n_report(uint8_t instance, uint8_t report_id,
+                      void const* report, uint16_t len);
+uint8_t tud_hid_n_get_protocol(uint8_t instance);
+#if DEBUG_MODE
+bool tud_cdc_n_write_flush(uint8_t itf);
+#endif
 }
 
 #define ESPNOW_CHAN 1
@@ -49,6 +59,9 @@ static uint32_t usbGoneSinceMs = 0;
 USBHIDKeyboard UsbKbd;
 USBHIDMouse UsbMouse;
 USBHIDConsumerControl UsbConsumer;
+#if DEBUG_MODE
+USBCDC DbgSerial;
+#endif
 
 #pragma pack(push, 1)
 struct MousePkt {
@@ -86,9 +99,16 @@ volatile bool hostSuspended = false;
 static uint32_t bootMs = 0;
 volatile uint32_t lastPacketMs = 0;
 
+#if DEBUG_MODE
+static volatile uint32_t dbgEspRecv = 0;
+#endif
+
 void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (len < 1) return;
   lastPacketMs = millis();
+#if DEBUG_MODE
+  dbgEspRecv++;
+#endif
 
   switch (data[0]) {
     case PKT_ACTIVATE:
@@ -134,18 +154,58 @@ void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
 static inline bool ensureUsbAwake() {
     if (tud_suspended()) {
         tud_remote_wakeup();
-        vTaskDelay(pdMS_TO_TICKS(20));
+        // Brief yield — loop() on core 0 is also fighting autosuspend,
+        // so the device should resume within a few ms.
+        vTaskDelay(pdMS_TO_TICKS(2));
         return tud_mounted() && !tud_suspended();
     }
     return tud_mounted();
 }
 
+#define MOUSE_REPORT_ID 2
+#define KBD_REPORT_ID   1
+
+static inline bool sendMouseDirect(const HIDMouseReport &rpt) {
+  if (!tud_hid_n_ready(0)) return false;
+  uint8_t rid = (tud_hid_n_get_protocol(0) == 0) ? 0 : MOUSE_REPORT_ID;
+  return tud_hid_n_report(0, rid, &rpt, sizeof(rpt));
+}
+
+static inline bool sendKbdDirect(const KbdPkt &k) {
+  if (!tud_hid_n_ready(0)) return false;
+  uint8_t rid = (tud_hid_n_get_protocol(0) == 0) ? 0 : KBD_REPORT_ID;
+  uint8_t report[8];
+  report[0] = k.mod;
+  report[1] = 0;
+  memcpy(&report[2], k.keys, 6);
+  return tud_hid_n_report(0, rid, report, 8);
+}
+
 static uint32_t lastInputMs = 0;
+
+// ── Debug stats (compiled out when DEBUG_MODE=false) ──
+#if DEBUG_MODE
+static uint32_t dbgLastStatMs = 0;
+static volatile uint32_t dbgUsbSends = 0;   // successful sendMouseDirect calls
+// dbgEspRecv declared before onRecv (forward ref)
+static volatile uint32_t dbgMerges = 0;     // merge loop triggered (grabbed ≥1 extra)
+static volatile uint32_t dbgBusyWaitSum = 0; // sum of busy-wait iterations
+static volatile uint32_t dbgBusyWaitCnt = 0; // number of busy-waits
+static volatile uint32_t dbgBusyWaitMax = 0; // max busy-wait iterations in period
+static volatile uint8_t  dbgMouseQPeak = 0;
+static volatile uint8_t  dbgKbdQPeak = 0;
+#endif
+
 
 void usbTask(void *pvParameters) {
   MousePkt p;
   KbdPkt k;
   HIDMouseReport rpt;
+
+  // Pending packet that failed to send last iteration (sendReport returned
+  // false because endpoint was busy). Retried before dequeuing new data.
+  bool hasPending = false;
+  MousePkt pending;
 
   while (true) {
     // While Mac is sleeping, discard all queued events to prevent waking it
@@ -154,6 +214,7 @@ void usbTask(void *pvParameters) {
       xQueueReset(kbdQ);
       pendingActivate = false;
       pendingDeactivate = false;
+      hasPending = false;
       vTaskDelay(pdMS_TO_TICKS(100));
       continue;
     }
@@ -163,9 +224,10 @@ void usbTask(void *pvParameters) {
       if (deviceActive) {
         deviceActive = false;
         UsbKbd.releaseAll();
-        UsbMouse.release(MOUSE_LEFT | MOUSE_RIGHT | MOUSE_MIDDLE);
+        { HIDMouseReport rel = {}; sendMouseDirect(rel); }
         UsbConsumer.release();
         prevBtn = 0;
+        hasPending = false;
         xQueueReset(mouseQ);
         xQueueReset(kbdQ);
       }
@@ -174,53 +236,128 @@ void usbTask(void *pvParameters) {
       pendingActivate = false;
       if (!deviceActive) {
         UsbKbd.releaseAll();
-        UsbMouse.release(MOUSE_LEFT | MOUSE_RIGHT | MOUSE_MIDDLE);
+        { HIDMouseReport rel = {}; sendMouseDirect(rel); }
         prevBtn = 0;
+        hasPending = false;
         deviceActive = true;
         lastInputMs = millis();
       }
     }
 
     bool hasActivity = false;
-    while (deviceActive && xQueueReceive(mouseQ, &p, 0) == pdTRUE) {
-      hasActivity = true;
-      if (!ensureUsbAwake()) break;
-    
-      int16_t rx = p.dx;
-      int16_t ry = p.dy;
-      int8_t rw = p.whl;
 
-      do {
-        int8_t sx = (rx > 127) ? 127 : (rx < -127) ? -127 : (int8_t)rx;
-        int8_t sy = (ry > 127) ? 127 : (ry < -127) ? -127 : (int8_t)ry;
+#if DEBUG_MODE
+    { uint8_t mq = uxQueueMessagesWaiting(mouseQ);
+      uint8_t kq = uxQueueMessagesWaiting(kbdQ);
+      if (mq > dbgMouseQPeak) dbgMouseQPeak = mq;
+      if (kq > dbgKbdQPeak) dbgKbdQPeak = kq; }
+#endif
+
+    // ── Unified HID send loop: mouse priority, keyboard in gaps ──
+    // Single endpoint shared between mouse & keyboard. Mouse gets every
+    // available frame. Keyboard only sends when mouseQ is empty.
+    // Both use tud_hid_n_report() directly — no Arduino blocking.
+    {
+      while (deviceActive) {
+        // Wait for endpoint ready (up to 5ms, 10µs granularity)
+        if (!tud_hid_n_ready(0)) {
+          int w = 0;
+          for (; w < 500 && !tud_hid_n_ready(0); w++)
+            delayMicroseconds(10);
+#if DEBUG_MODE
+          dbgBusyWaitSum += w;
+          dbgBusyWaitCnt++;
+          if ((uint32_t)w > dbgBusyWaitMax) dbgBusyWaitMax = w;
+#endif
+          if (!tud_hid_n_ready(0)) break;  // truly stuck >5ms
+        }
+
+        if (!ensureUsbAwake()) break;
+
+        // Mouse has priority
+        if (hasPending) {
+          p = pending;
+          hasPending = false;
+        } else if (xQueueReceive(mouseQ, &p, 0) == pdTRUE) {
+          // got a mouse event
+        } else if (xQueueReceive(kbdQ, &k, 0) == pdTRUE) {
+          // No mouse pending → send keyboard
+          sendKbdDirect(k);
+          hasActivity = true;
+          continue;
+        } else {
+          break;  // nothing to send
+        }
+
+        // Merge when queue builds up — drains backlog quickly after glitches
+        if (uxQueueMessagesWaiting(mouseQ) > 16) {
+          MousePkt extra;
+          while (xQueueReceive(mouseQ, &extra, 0) == pdTRUE) {
+            p.btn = extra.btn;
+            p.dx += extra.dx;
+            p.dy += extra.dy;
+            p.whl += extra.whl;
+          }
+#if DEBUG_MODE
+          dbgMerges++;
+#endif
+        }
 
         rpt.buttons = p.btn;
-        rpt.x = sx;
-        rpt.y = sy;
-        rpt.wheel = rw;
+        rpt.x = (p.dx > 127) ? 127 : (p.dx < -127) ? -127 : (int8_t)p.dx;
+        rpt.y = (p.dy > 127) ? 127 : (p.dy < -127) ? -127 : (int8_t)p.dy;
+        rpt.wheel = p.whl;
         rpt.pan = 0;
-        UsbMouse.sendReport(rpt);
 
-        rx -= sx;
-        ry -= sy;
-        rw = 0;
+        if (!sendMouseDirect(rpt)) {
+          pending = p;
+          hasPending = true;
+          break;
+        }
+        if (p.dx != 0 || p.dy != 0 || p.whl != 0 || p.btn != prevBtn)
+          hasActivity = true;
+        prevBtn = p.btn;
+#if DEBUG_MODE
+        dbgUsbSends++;
+#endif
 
-      } while (rx != 0 || ry != 0);
-
-      prevBtn = p.btn;
-    }
-
-    while (deviceActive && xQueueReceive(kbdQ, &k, 0) == pdTRUE) {
-      hasActivity = true;
-      if (!ensureUsbAwake()) break;
-
-      KeyReport rpt;
-      rpt.modifiers = k.mod;
-      rpt.reserved = 0;
-      memcpy(rpt.keys, k.keys, 6);
-      UsbKbd.sendReport(&rpt);
+        // If delta was clipped to ±127, send remainder next iteration
+        int16_t remDx = p.dx - (int16_t)rpt.x;
+        int16_t remDy = p.dy - (int16_t)rpt.y;
+        if (remDx != 0 || remDy != 0) {
+          pending.btn = p.btn;
+          pending.dx = remDx;
+          pending.dy = remDy;
+          pending.whl = 0;
+          hasPending = true;
+          break;
+        }
+      }
     }
     if (hasActivity) lastInputMs = millis();
+
+#if DEBUG_MODE
+    // Print stats in the gap after HID loop exits (endpoint idle → CDC can send)
+    {
+      uint32_t now = millis();
+      if (now - dbgLastStatMs >= 1000) {
+        uint32_t elapsed = now - dbgLastStatMs;
+        dbgLastStatMs = now;
+        uint16_t usbHz  = elapsed ? (uint16_t)(dbgUsbSends * 1000UL / elapsed) : 0;
+        uint16_t espHz  = elapsed ? (uint16_t)(dbgEspRecv  * 1000UL / elapsed) : 0;
+        uint16_t mrgHz  = elapsed ? (uint16_t)(dbgMerges   * 1000UL / elapsed) : 0;
+        uint16_t avgW   = dbgBusyWaitCnt ? (uint16_t)((dbgBusyWaitSum * 10UL) / dbgBusyWaitCnt) : 0;
+        uint16_t maxW   = (uint16_t)(dbgBusyWaitMax * 10);
+        DbgSerial.printf("usb:%d esp:%d mrg:%d w:%d/%d q:%d,%d act:%d\n",
+          usbHz, espHz, mrgHz, avgW, maxW,
+          dbgMouseQPeak, dbgKbdQPeak, deviceActive ? 1 : 0);
+        tud_cdc_n_write_flush(0);  // non-blocking: queues CDC transfer, returns immediately
+        dbgUsbSends = 0; dbgEspRecv = 0; dbgMerges = 0;
+        dbgBusyWaitSum = 0; dbgBusyWaitCnt = 0; dbgBusyWaitMax = 0;
+        dbgMouseQPeak = 0; dbgKbdQPeak = 0;
+      }
+    }
+#endif
 
     if (!deviceActive) {
       vTaskDelay(100);
@@ -229,13 +366,13 @@ void usbTask(void *pvParameters) {
     } else {
       uint32_t millisNow = millis() - lastInputMs;
       if (millisNow > USB_IDLE_TIMEOUT_MS_4) {
-          vTaskDelay(pdMS_TO_TICKS(USB_IDLE_DELAY_MS_4));  
+          vTaskDelay(pdMS_TO_TICKS(USB_IDLE_DELAY_MS_4));
       } else if (millisNow > USB_IDLE_TIMEOUT_MS_3) {
-          vTaskDelay(pdMS_TO_TICKS(USB_IDLE_DELAY_MS_3));  
+          vTaskDelay(pdMS_TO_TICKS(USB_IDLE_DELAY_MS_3));
       } else if (millisNow > USB_IDLE_TIMEOUT_MS_2) {
           vTaskDelay(pdMS_TO_TICKS(USB_IDLE_DELAY_MS_2));
       } else if (millisNow > USB_IDLE_TIMEOUT_MS_1) {
-          vTaskDelay(pdMS_TO_TICKS(USB_IDLE_DELAY_MS_1));  
+          vTaskDelay(pdMS_TO_TICKS(USB_IDLE_DELAY_MS_1));
       } else {
         taskYIELD();
       }
@@ -249,6 +386,9 @@ void setup() {
   UsbMouse.begin();
   UsbKbd.begin();
   UsbConsumer.begin();
+#if DEBUG_MODE
+  DbgSerial.begin();
+#endif
   USB.usbAttributes(0xA0);
   USB.begin();
 
@@ -261,9 +401,14 @@ void setup() {
   esp_wifi_set_ps(WIFI_PS_NONE);
 
   esp_wifi_set_channel(ESPNOW_CHAN, WIFI_SECOND_CHAN_NONE);
-  if (esp_now_init() == ESP_OK) esp_now_register_recv_cb(onRecv);
+  if (esp_now_init() == ESP_OK) {
+    esp_now_register_recv_cb(onRecv);
+  }
 
   lastPacketMs = millis();
+#if DEBUG_MODE
+  dbgLastStatMs = millis();
+#endif
   xTaskCreatePinnedToCore(usbTask, "USB", 4096, NULL, 10, NULL, 1);
 }
 void loop() {
@@ -304,8 +449,18 @@ void loop() {
     return;
   }
 
-  // ── USB host suspended (Mac sleeping) ──
+  // ── USB host suspended ──
   if (suspended) {
+    // Fight autosuspend during active use (recent input within 5s).
+    // Linux suspends the composite device when CDC has no reader,
+    // which permanently degrades the HID endpoint polling rate.
+    if (deviceActive && (now - lastInputMs < 5000)) {
+      tud_remote_wakeup();
+      delay(10);
+      return;
+    }
+
+    // Real suspend: computer sleep, switched away, or idle >5s
     hostSuspended = true;
     if (!wasSuspended) {
       wasActiveBeforeSuspend = deviceActive;

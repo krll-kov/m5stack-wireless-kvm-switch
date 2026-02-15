@@ -37,10 +37,6 @@ static const uint8_t KBD_XOR[7] = {0x4B,0x56,0x4D,0x53,0x77,0x31,0x7A};
 
 #define BLE_KBD_MATCH "Keyboard"
 #define ESPNOW_CHAN 1
-// Real send speed will be 1000 with this number, it just has to be higher than
-// actual mouse hz input
-#define MOUSE_SEND_HZ 2100
-#define MOUSE_SEND_US (1000000 / MOUSE_SEND_HZ)
 #define SWITCH_DEBOUNCE_MS 300
 #define HEARTBEAT_MS 500
 #define BLE_SCAN_BUDGET_MS 20000
@@ -121,6 +117,7 @@ temperature_sensor_handle_t temp_handle = NULL;
 
 static volatile uint32_t lastActivityMs = 0;
 static volatile uint32_t lastPCSwitchMs = 0;
+static uint32_t lastScreenTouchMs = 0;
 static volatile int lastIdleLevel = 0;
 static volatile bool screenTurnedOff = false;
 static volatile bool wifiNeedsBackToNormal = false;
@@ -129,15 +126,6 @@ static volatile bool wifiNeedsBackToNormal = false;
 #define IDLE2_TIMEOUT_MS 60000
 #define IDLE3_TIMEOUT_MS 300000
 #define IDLE4_TIMEOUT_MS 900000
-
-#define IDLE1_MOUSE_SEND_HZ (MOUSE_SEND_HZ / 2)
-#define IDLE2_MOUSE_SEND_HZ 100
-#define IDLE3_MOUSE_SEND_HZ 30
-#define IDLE4_MOUSE_SEND_HZ 2
-#define IDLE1_MOUSE_SEND_US (1000000 / IDLE1_MOUSE_SEND_HZ)
-#define IDLE2_MOUSE_SEND_US (1000000 / IDLE2_MOUSE_SEND_HZ)
-#define IDLE3_MOUSE_SEND_US (1000000 / IDLE3_MOUSE_SEND_HZ)
-#define IDLE4_MOUSE_SEND_US (1000000 / IDLE4_MOUSE_SEND_HZ)
 
 #define IDLE1_HEARTBEAT_MS 500
 #define IDLE2_HEARTBEAT_MS 600
@@ -160,6 +148,7 @@ static int idleLevel() {
 
 // ── Debug stats (compiled out when DEBUG_MODE=false) ──
 #if DEBUG_MODE
+
 static volatile uint32_t dbgUsbCb = 0, dbgUsbHz = 0;
 static volatile uint32_t dbgEspTx = 0, dbgEspHz = 0;
 static volatile uint32_t dbgMsTx = 0, dbgMsHz = 0;
@@ -304,7 +293,10 @@ static void txMouse(const mouse_evt_t *m) {
                   (uint8_t)(m->y & 0xFF),
                   (uint8_t)((m->y >> 8) & 0xFF),
                   (uint8_t)m->wheel};
-  esp_now_send(broadcastMac, p, 7);  // broadcast = no ACK wait
+  if (esp_now_send(broadcastMac, p, 7) != ESP_OK) {
+    taskYIELD();  // let WiFi task drain TX queue
+    esp_now_send(broadcastMac, p, 7);  // one retry
+  }
 #if DEBUG_MODE
   dbgEspTx++;
 #endif
@@ -313,7 +305,11 @@ static void txKbd(const kbd_evt_t *k) {
   uint8_t p[8] = {PKT_KEYBOARD, k->modifiers};
   memcpy(&p[2], k->keys, 6);
   for (int i = 0; i < 7; i++) p[1 + i] ^= KBD_XOR[i];
-  esp_now_send(activeMac(), p, 8);
+  const uint8_t *dst = activeMac();
+  for (int attempt = 0; attempt < 3; attempt++) {
+    if (esp_now_send(dst, p, 8) == ESP_OK) break;
+    taskYIELD();
+  }
 }
 
 // ===================== USB Host Shield 2.0 — BTHID =====================
@@ -483,12 +479,26 @@ void max3421Poll() {
   bool connected = bthid.connected;
   if (connected && !wasConnected) {
     mxClassicConnected = true;
+    classicKbdKnown = true;
+    bleKbdConnected = true;
+    appleFnDown = false;
+    activeFkeyConsumer = 0;
+    kbdBatteryPct = -1;
+    if (Btd.remote_name[0])
+      strncpy(bleFoundName, (const char *)Btd.remote_name, sizeof(bleFoundName) - 1);
+    else
+      strncpy(bleFoundName, "Classic HID", sizeof(bleFoundName) - 1);
+    bleState = 4;
     snprintf(maxStatusMsg, sizeof(maxStatusMsg), "classic HID!");
     Serial.println("BTHID connected");
     needRedraw = true;
   } else if (!connected && wasConnected) {
     mxClassicConnected = false;
+    bleKbdConnected = false;
     kbdBatteryPct = -1;
+    appleFnDown = false;
+    activeFkeyConsumer = 0;
+    bleState = 5;
     snprintf(maxStatusMsg, sizeof(maxStatusMsg), "classic disc");
     Serial.println("BTHID disconnected");
     // Force-clear L2CAP claim so reconnection can start fresh.
@@ -600,9 +610,15 @@ void max3421Poll() {
       } else if (millis() - fnChangeMs >= 50) {
         fnSentState = rawFn;
         appleFnDown = rawFn;
-        uint16_t usage = rawFn ? 0x029D : 0x0000;
-        uint8_t p[3] = {PKT_CONSUMER, (uint8_t)(usage & 0xFF), (uint8_t)(usage >> 8)};
-        esp_now_send(activeMac(), p, 3);
+        if (rawFn) {
+          // Press: always send globe
+          uint8_t p[3] = {PKT_CONSUMER, 0x9D, 0x02};
+          esp_now_send(activeMac(), p, 3);
+        } else if (activeFkeyConsumer == 0) {
+          // Release: only if no F-key consumer is active (would cancel it)
+          uint8_t p[3] = {PKT_CONSUMER, 0x00, 0x00};
+          esp_now_send(activeMac(), p, 3);
+        }
       }
     }
   }
@@ -824,7 +840,9 @@ void usbHostTask(void *) {
   usb_host_client_register(&cc, &usbClient);
 
   while (true) {
-    usb_host_lib_handle_events(1, NULL);
+    int il = idleLevel();
+    int evtTimeout = (il >= 4) ? 100 : (il >= 3) ? 50 : (il >= 2) ? 20 : 1;
+    usb_host_lib_handle_events(evtTimeout, NULL);
     usb_host_client_handle_events(usbClient, 0);
 
     if (usbResetRequest) {
@@ -878,21 +896,17 @@ void usbHostTask(void *) {
       }
     }
 
-    taskYIELD();
+    if (il >= 2) vTaskDelay(pdMS_TO_TICKS(evtTimeout));
+    else taskYIELD();
   }
 }
 
 // ===================== MOUSE SEND TASK =====================
 void mouseSendTask(void *) {
-  mouse_evt_t m, acc = {};
-  uint8_t prevBtn = 0;
-  bool dirty = false, m4h = false;
-  uint32_t lastUs = 0;
+  mouse_evt_t m;
+  bool m4h = false;
   while (true) {
     if (switchInProgress) {
-      acc = {};
-      dirty = false;
-      prevBtn = 0;
       m4h = false;
       vTaskDelay(pdMS_TO_TICKS(2));
       continue;
@@ -903,54 +917,19 @@ void mouseSendTask(void *) {
     if (il == 0) waitTicks = portMAX_DELAY;
     else if (il <= 2) waitTicks = pdMS_TO_TICKS(5);
     else waitTicks = pdMS_TO_TICKS(50);
-    
-    bool got = xQueueReceive(mouseQueue, &m, waitTicks) == pdTRUE;
 
-    // Batch-drain: if we got one, grab all pending without blocking
-    if (got && !switchInProgress) {
-      do {
-        bool m4 = (m.buttons & 0x08);
-        if (m4 && !m4h && millis() - lastSwitchMs > SWITCH_DEBOUNCE_MS)
-          switchRequest = true;
-        m4h = m4;
-        uint8_t b3 = m.buttons & 0x07;
-        bool bc = (b3 != prevBtn);
-        acc.buttons = m.buttons;
-        acc.x += m.x;
-        acc.y += m.y;
-        acc.wheel += m.wheel;
-        dirty = true;
-        if (bc) {
-          txMouse(&acc);
-          prevBtn = b3;
-          acc = {};
-          acc.buttons = m.buttons;
-          dirty = false;
-          lastUs = micros();
-#if DEBUG_MODE
-          dbgMsTx++;
-#endif
-        }
-      } while (!switchInProgress && xQueueReceive(mouseQueue, &m, 0) == pdTRUE);
-    }
+    if (xQueueReceive(mouseQueue, &m, waitTicks) != pdTRUE) continue;
 
-    uint32_t sendInterval;
-    switch (idleLevel()) {
-      case 4: sendInterval = IDLE4_MOUSE_SEND_US; break;
-      case 3: sendInterval = IDLE3_MOUSE_SEND_US; break;
-      case 2: sendInterval = IDLE2_MOUSE_SEND_US; break;
-      case 1: sendInterval = IDLE1_MOUSE_SEND_US; break;
-      default: sendInterval = MOUSE_SEND_US; break;
-    }
-    if (dirty && micros() - lastUs >= sendInterval) {
-      txMouse(&acc);
-      acc = {};
-      dirty = false;
-      lastUs = micros();
+    // Handle button 4 (device switch)
+    bool m4 = (m.buttons & 0x08);
+    if (m4 && !m4h && millis() - lastSwitchMs > SWITCH_DEBOUNCE_MS)
+      switchRequest = true;
+    m4h = m4;
+
+    txMouse(&m);
 #if DEBUG_MODE
-      dbgMsTx++;
+    dbgMsTx++;
 #endif
-    }
   }
 }
 
@@ -1958,9 +1937,10 @@ static void drawUI() {
 #if DEBUG_MODE
   float cpuTemp = 0;
   if (temp_handle) temperature_sensor_get_celsius(temp_handle, &cpuTemp);
-  d.setCursor(8, 220);
+  d.setCursor(8, 218);
   d.setTextColor(cpuTemp > 60 ? RED : CYAN);
   d.printf("T:%.0fC U:%d E:%d Q:%d", cpuTemp, (int)dbgUsbHz, (int)dbgEspHz, dbgQPeak);
+
 #endif
 
   d.setCursor(8, 228);
@@ -1985,6 +1965,14 @@ static void drawUI() {
   } else {
     d.setTextColor(batPct > 20 ? COL_LABEL : RED);
     d.printf("Battery %d%%  %.2fV", batPct, batV);
+  }
+
+  // Idle level indicator (right side of bottom bar)
+  {
+    int il = idleLevel();
+    d.setCursor(296, 228);
+    d.setTextColor(il == 0 ? GREEN : (il <= 2 ? YELLOW : COL_ORANGE));
+    d.printf("I%d", il);
   }
 
   d.endWrite();
@@ -2085,6 +2073,20 @@ void setup() {
     bp.ifidx = WIFI_IF_STA;
     esp_now_add_peer(&bp);
   }
+  // Increase ESP-NOW PHY rate from default 1Mbps to 6.5Mbps HT20.
+  // At 1Mbps, air time alone limits to ~600 pps (with WiFi task overhead).
+  // At MCS0 HT20, practical throughput is 2500+ pps — enough for 1000Hz mouse.
+  {
+    esp_now_rate_config_t rate_cfg = {};
+    rate_cfg.phymode = WIFI_PHY_MODE_HT20;
+    rate_cfg.rate = WIFI_PHY_RATE_MCS0_LGI;
+    rate_cfg.ersu = false;
+    rate_cfg.dcm = false;
+    const uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
+    esp_now_set_peer_rate_config(bcast, &rate_cfg);
+    esp_now_set_peer_rate_config(ATOM_MAC_1, &rate_cfg);
+    esp_now_set_peer_rate_config(ATOM_MAC_2, &rate_cfg);
+  }
   sendCmd(ATOM_MAC_1, PKT_ACTIVATE);
   sendCmd(ATOM_MAC_2, PKT_DEACTIVATE);
 
@@ -2108,7 +2110,7 @@ void setup() {
   }
 #endif
 
-#if WITH_KEYBOARD
+#if WITH_KEYBOARD && !USE_MAX_MODULE
   xTaskCreatePinnedToCore(bleTask, "BLE", 64 * 1024, NULL, 1, NULL, 0);
 #endif
 
@@ -2142,6 +2144,12 @@ void loop() {
     lastPCSwitchMs = lastActivityMs;
     switchRequest = false;
     switchTarget();
+  }
+
+  // Other touch buttons: just wake screen for 20s
+  if (M5.BtnB.wasPressed() || M5.BtnC.wasPressed() || M5.BtnPWR.wasPressed()) {
+    lastActivityMs = millis();
+    lastScreenTouchMs = lastActivityMs;
   }
 
   kbd_evt_t k;
@@ -2189,6 +2197,9 @@ void loop() {
 
   // 10s after PC switch
   if (millis() - lastPCSwitchMs < 10000) screenNeeded = true;
+
+  // 20s after touch button press
+  if (millis() - lastScreenTouchMs < 20000) screenNeeded = true;
 
   if (screenNeeded && screenTurnedOff) {
       M5.Display.wakeup();
