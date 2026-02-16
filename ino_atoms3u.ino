@@ -12,7 +12,6 @@
 
 #define DEBUG_MODE false
 
-// ── TinyUSB functions (always linked when USB-OTG mode) ──
 extern "C" {
 bool tud_mounted(void);
 bool tud_suspended(void);
@@ -40,12 +39,10 @@ static const uint8_t KBD_XOR[7] = {0x4B,0x56,0x4D,0x53,0x77,0x31,0x7A};
 #define PKT_HEARTBEAT 0x05
 #define PKT_CONSUMER 0x06
 
-// ── Watchdog thresholds ──
-#define BOOT_GRACE_MS 5000      // USB enumeration grace period after boot
-#define ESPNOW_TIMEOUT_MS 3400  // no packets from CoreS3 → esp_now_deinit
-
-static uint32_t usbGoneSinceMs = 0;
-#define USB_GONE_REPLUG_MS 30000
+#define BOOT_GRACE_MS       5000
+#define ESPNOW_TIMEOUT_MS   3400
+#define USB_GONE_REPLUG_MS  3000
+#define WAKE_REPLUG_MS      3000
 
 #define USB_IDLE_TIMEOUT_MS_4 900000
 #define USB_IDLE_DELAY_MS_4   100
@@ -54,7 +51,7 @@ static uint32_t usbGoneSinceMs = 0;
 #define USB_IDLE_TIMEOUT_MS_2 60000
 #define USB_IDLE_DELAY_MS_2   20
 #define USB_IDLE_TIMEOUT_MS_1 10000
-#define USB_IDLE_DELAY_MS_1  1
+#define USB_IDLE_DELAY_MS_1   1
 
 USBHIDKeyboard UsbKbd;
 USBHIDMouse UsbMouse;
@@ -90,17 +87,26 @@ volatile bool pendingActivate = false;
 volatile bool pendingDeactivate = false;
 static uint8_t prevBtn = 0;
 
-// Sleep/wake state tracking
 static bool wasSuspended = false;
 static bool wasActiveBeforeSuspend = false;
 volatile bool hostSuspended = false;
 
-// ── Health state ──
 static uint32_t bootMs = 0;
 volatile uint32_t lastPacketMs = 0;
+static uint32_t usbGoneSinceMs = 0;
+static uint32_t wakeTransitionStart = 0;
+static uint32_t lastInputMs = 0;
 
 #if DEBUG_MODE
 static volatile uint32_t dbgEspRecv = 0;
+static uint32_t dbgLastStatMs = 0;
+static volatile uint32_t dbgUsbSends = 0;
+static volatile uint32_t dbgMerges = 0;
+static volatile uint32_t dbgBusyWaitSum = 0;
+static volatile uint32_t dbgBusyWaitCnt = 0;
+static volatile uint32_t dbgBusyWaitMax = 0;
+static volatile uint8_t  dbgMouseQPeak = 0;
+static volatile uint8_t  dbgKbdQPeak = 0;
 #endif
 
 void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
@@ -152,14 +158,12 @@ void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
 }
 
 static inline bool ensureUsbAwake() {
-    if (tud_suspended()) {
-        tud_remote_wakeup();
-        // Brief yield — loop() on core 0 is also fighting autosuspend,
-        // so the device should resume within a few ms.
-        vTaskDelay(pdMS_TO_TICKS(2));
-        return tud_mounted() && !tud_suspended();
-    }
-    return tud_mounted();
+  if (tud_suspended()) {
+    tud_remote_wakeup();
+    vTaskDelay(pdMS_TO_TICKS(2));
+    return tud_mounted() && !tud_suspended();
+  }
+  return tud_mounted();
 }
 
 #define MOUSE_REPORT_ID 2
@@ -181,34 +185,14 @@ static inline bool sendKbdDirect(const KbdPkt &k) {
   return tud_hid_n_report(0, rid, report, 8);
 }
 
-static uint32_t lastInputMs = 0;
-
-// ── Debug stats (compiled out when DEBUG_MODE=false) ──
-#if DEBUG_MODE
-static uint32_t dbgLastStatMs = 0;
-static volatile uint32_t dbgUsbSends = 0;   // successful sendMouseDirect calls
-// dbgEspRecv declared before onRecv (forward ref)
-static volatile uint32_t dbgMerges = 0;     // merge loop triggered (grabbed ≥1 extra)
-static volatile uint32_t dbgBusyWaitSum = 0; // sum of busy-wait iterations
-static volatile uint32_t dbgBusyWaitCnt = 0; // number of busy-waits
-static volatile uint32_t dbgBusyWaitMax = 0; // max busy-wait iterations in period
-static volatile uint8_t  dbgMouseQPeak = 0;
-static volatile uint8_t  dbgKbdQPeak = 0;
-#endif
-
-
 void usbTask(void *pvParameters) {
   MousePkt p;
   KbdPkt k;
   HIDMouseReport rpt;
-
-  // Pending packet that failed to send last iteration (sendReport returned
-  // false because endpoint was busy). Retried before dequeuing new data.
   bool hasPending = false;
   MousePkt pending;
 
   while (true) {
-    // While Mac is sleeping, discard all queued events to prevent waking it
     if (hostSuspended) {
       xQueueReset(mouseQ);
       xQueueReset(kbdQ);
@@ -253,13 +237,8 @@ void usbTask(void *pvParameters) {
       if (kq > dbgKbdQPeak) dbgKbdQPeak = kq; }
 #endif
 
-    // ── Unified HID send loop: mouse priority, keyboard in gaps ──
-    // Single endpoint shared between mouse & keyboard. Mouse gets every
-    // available frame. Keyboard only sends when mouseQ is empty.
-    // Both use tud_hid_n_report() directly — no Arduino blocking.
     {
       while (deviceActive) {
-        // Wait for endpoint ready (up to 5ms, 10µs granularity)
         if (!tud_hid_n_ready(0)) {
           int w = 0;
           for (; w < 500 && !tud_hid_n_ready(0); w++)
@@ -269,27 +248,23 @@ void usbTask(void *pvParameters) {
           dbgBusyWaitCnt++;
           if ((uint32_t)w > dbgBusyWaitMax) dbgBusyWaitMax = w;
 #endif
-          if (!tud_hid_n_ready(0)) break;  // truly stuck >5ms
+          if (!tud_hid_n_ready(0)) break;
         }
 
         if (!ensureUsbAwake()) break;
 
-        // Mouse has priority
         if (hasPending) {
           p = pending;
           hasPending = false;
         } else if (xQueueReceive(mouseQ, &p, 0) == pdTRUE) {
-          // got a mouse event
         } else if (xQueueReceive(kbdQ, &k, 0) == pdTRUE) {
-          // No mouse pending → send keyboard
           sendKbdDirect(k);
           hasActivity = true;
           continue;
         } else {
-          break;  // nothing to send
+          break;
         }
 
-        // Merge when queue builds up — drains backlog quickly after glitches
         if (uxQueueMessagesWaiting(mouseQ) > 16) {
           MousePkt extra;
           while (xQueueReceive(mouseQ, &extra, 0) == pdTRUE) {
@@ -321,7 +296,6 @@ void usbTask(void *pvParameters) {
         dbgUsbSends++;
 #endif
 
-        // If delta was clipped to ±127, send remainder next iteration
         int16_t remDx = p.dx - (int16_t)rpt.x;
         int16_t remDy = p.dy - (int16_t)rpt.y;
         if (remDx != 0 || remDy != 0) {
@@ -337,7 +311,6 @@ void usbTask(void *pvParameters) {
     if (hasActivity) lastInputMs = millis();
 
 #if DEBUG_MODE
-    // Print stats in the gap after HID loop exits (endpoint idle → CDC can send)
     {
       uint32_t now = millis();
       if (now - dbgLastStatMs >= 1000) {
@@ -351,7 +324,7 @@ void usbTask(void *pvParameters) {
         DbgSerial.printf("usb:%d esp:%d mrg:%d w:%d/%d q:%d,%d act:%d\n",
           usbHz, espHz, mrgHz, avgW, maxW,
           dbgMouseQPeak, dbgKbdQPeak, deviceActive ? 1 : 0);
-        tud_cdc_n_write_flush(0);  // non-blocking: queues CDC transfer, returns immediately
+        tud_cdc_n_write_flush(0);
         dbgUsbSends = 0; dbgEspRecv = 0; dbgMerges = 0;
         dbgBusyWaitSum = 0; dbgBusyWaitCnt = 0; dbgBusyWaitMax = 0;
         dbgMouseQPeak = 0; dbgKbdQPeak = 0;
@@ -366,13 +339,13 @@ void usbTask(void *pvParameters) {
     } else {
       uint32_t millisNow = millis() - lastInputMs;
       if (millisNow > USB_IDLE_TIMEOUT_MS_4) {
-          vTaskDelay(pdMS_TO_TICKS(USB_IDLE_DELAY_MS_4));
+        vTaskDelay(pdMS_TO_TICKS(USB_IDLE_DELAY_MS_4));
       } else if (millisNow > USB_IDLE_TIMEOUT_MS_3) {
-          vTaskDelay(pdMS_TO_TICKS(USB_IDLE_DELAY_MS_3));
+        vTaskDelay(pdMS_TO_TICKS(USB_IDLE_DELAY_MS_3));
       } else if (millisNow > USB_IDLE_TIMEOUT_MS_2) {
-          vTaskDelay(pdMS_TO_TICKS(USB_IDLE_DELAY_MS_2));
+        vTaskDelay(pdMS_TO_TICKS(USB_IDLE_DELAY_MS_2));
       } else if (millisNow > USB_IDLE_TIMEOUT_MS_1) {
-          vTaskDelay(pdMS_TO_TICKS(USB_IDLE_DELAY_MS_1));
+        vTaskDelay(pdMS_TO_TICKS(USB_IDLE_DELAY_MS_1));
       } else {
         taskYIELD();
       }
@@ -397,9 +370,7 @@ void setup() {
 
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
-
   esp_wifi_set_ps(WIFI_PS_NONE);
-
   esp_wifi_set_channel(ESPNOW_CHAN, WIFI_SECOND_CHAN_NONE);
   if (esp_now_init() == ESP_OK) {
     esp_now_register_recv_cb(onRecv);
@@ -411,24 +382,40 @@ void setup() {
 #endif
   xTaskCreatePinnedToCore(usbTask, "USB", 4096, NULL, 10, NULL, 1);
 }
+
 void loop() {
   uint32_t now = millis();
   bool grace = (now - bootMs) < BOOT_GRACE_MS;
-
   bool mounted = tud_mounted();
   bool suspended = tud_suspended();
 
-  // ── USB host gone (port powered off) ──
+  // USB bus lost (host powered off or wake transition)
   if (!mounted && !suspended && !grace) {
-    // If we were suspended (Mac sleeping), this is a USB resume transition,
-    // not a true "USB gone" — use a shorter delay and skip replug timer.
+    hostSuspended = false;
+
     if (wasSuspended) {
+      // Waking from sleep — give macOS time to re-enumerate
+      if (wakeTransitionStart == 0) {
+        wakeTransitionStart = now;
+        tud_remote_wakeup();
+      }
+
+      if (now - wakeTransitionStart > WAKE_REPLUG_MS) {
+        wakeTransitionStart = 0;
+        tud_disconnect();
+        vTaskDelay(pdMS_TO_TICKS(500));
+        tud_connect();
+        lastPacketMs = now;
+        delay(200);
+        return;
+      }
+
       lastPacketMs = now;
       delay(50);
       return;
     }
 
-    hostSuspended = false;
+    // Truly gone — not a wake transition
     if (deviceActive) {
       deviceActive = false;
       xQueueReset(mouseQ);
@@ -440,27 +427,17 @@ void loop() {
       usbGoneSinceMs = now;
     } else if (now - usbGoneSinceMs > USB_GONE_REPLUG_MS) {
       tud_disconnect();
-      vTaskDelay(pdMS_TO_TICKS(1000));
+      vTaskDelay(pdMS_TO_TICKS(500));
       tud_connect();
       usbGoneSinceMs = now;
     }
 
-    delay(500);
+    delay(200);
     return;
   }
 
-  // ── USB host suspended ──
+  // USB suspended by host
   if (suspended) {
-    // Fight autosuspend during active use (recent input within 5s).
-    // Linux suspends the composite device when CDC has no reader,
-    // which permanently degrades the HID endpoint polling rate.
-    if (deviceActive && (now - lastInputMs < 5000)) {
-      tud_remote_wakeup();
-      delay(10);
-      return;
-    }
-
-    // Real suspend: computer sleep, switched away, or idle >5s
     hostSuspended = true;
     if (!wasSuspended) {
       wasActiveBeforeSuspend = deviceActive;
@@ -477,13 +454,13 @@ void loop() {
     return;
   }
 
-  // ── Normal operation: mounted == true ──
+  // Normal operation — mounted and not suspended
   hostSuspended = false;
   usbGoneSinceMs = 0;
 
-  // Just resumed from suspend — restore active state immediately
   if (wasSuspended) {
     wasSuspended = false;
+    wakeTransitionStart = 0;
     if (wasActiveBeforeSuspend) {
       deviceActive = true;
       lastInputMs = millis();
