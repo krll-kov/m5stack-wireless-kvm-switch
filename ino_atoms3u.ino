@@ -38,6 +38,7 @@ static const uint8_t KBD_XOR[7] = {0x4B,0x56,0x4D,0x53,0x77,0x31,0x7A};
 #define PKT_DEACTIVATE 0x04
 #define PKT_HEARTBEAT 0x05
 #define PKT_CONSUMER 0x06
+#define PKT_APPLE_FN 0x07
 
 #define BOOT_GRACE_MS       5000
 #define ESPNOW_TIMEOUT_MS   3400
@@ -53,9 +54,47 @@ static const uint8_t KBD_XOR[7] = {0x4B,0x56,0x4D,0x53,0x77,0x31,0x7A};
 #define USB_IDLE_TIMEOUT_MS_1 10000
 #define USB_IDLE_DELAY_MS_1   1
 
+#define APPLE_FN_REPORT_ID 5
+
+static const uint8_t appleFnDesc[] = {
+  0x06, 0xFF, 0x00,           // Usage Page (Apple Vendor Top Case 0x00FF)
+  0x09, 0x03,                 // Usage (Keyboard Fn)
+  0xA1, 0x01,                 // Collection (Application)
+    0x85, APPLE_FN_REPORT_ID, //   Report ID
+    0x06, 0xFF, 0x00,         //   Usage Page (Apple Vendor Top Case)
+    0x09, 0x03,               //   Usage (Keyboard Fn)
+    0x15, 0x00,               //   Logical Minimum (0)
+    0x25, 0x01,               //   Logical Maximum (1)
+    0x75, 0x01,               //   Report Size (1)
+    0x95, 0x01,               //   Report Count (1)
+    0x81, 0x02,               //   Input (Data, Variable, Absolute)
+    0x75, 0x07,               //   Report Size (7)
+    0x95, 0x01,               //   Report Count (1)
+    0x81, 0x01,               //   Input (Constant)
+  0xC0                        // End Collection
+};
+
+class USBHIDAppleFn : public USBHIDDevice {
+  USBHID hid;
+public:
+  USBHIDAppleFn() : hid() {
+    static bool initialized = false;
+    if (!initialized) {
+      initialized = true;
+      hid.addDevice(this, sizeof(appleFnDesc));
+    }
+  }
+  void begin() { hid.begin(); }
+  uint16_t _onGetDescriptor(uint8_t *dst) override {
+    memcpy(dst, appleFnDesc, sizeof(appleFnDesc));
+    return sizeof(appleFnDesc);
+  }
+};
+
 USBHIDKeyboard UsbKbd;
 USBHIDMouse UsbMouse;
 USBHIDConsumerControl UsbConsumer;
+USBHIDAppleFn UsbAppleFn;
 #if DEBUG_MODE
 USBCDC DbgSerial;
 #endif
@@ -81,6 +120,8 @@ struct HIDMouseReport {
 
 QueueHandle_t mouseQ;
 QueueHandle_t kbdQ;
+QueueHandle_t consumerQ;
+QueueHandle_t appleFnQ;
 
 volatile bool deviceActive = false;
 volatile bool pendingActivate = false;
@@ -146,10 +187,13 @@ void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
     case PKT_CONSUMER:
       if (len >= 3 && deviceActive) {
         uint16_t usage = data[1] | ((uint16_t)data[2] << 8);
-        if (usage)
-          UsbConsumer.press(usage);
-        else
-          UsbConsumer.release();
+        xQueueSend(consumerQ, &usage, 0);
+      }
+      break;
+    case PKT_APPLE_FN:
+      if (len >= 2 && deviceActive) {
+        uint8_t fn = data[1];
+        xQueueSend(appleFnQ, &fn, 0);
       }
       break;
     case PKT_HEARTBEAT:
@@ -166,8 +210,9 @@ static inline bool ensureUsbAwake() {
   return tud_mounted();
 }
 
-#define MOUSE_REPORT_ID 2
-#define KBD_REPORT_ID   1
+#define MOUSE_REPORT_ID    2
+#define KBD_REPORT_ID      1
+#define CONSUMER_REPORT_ID 4
 
 static inline bool sendMouseDirect(const HIDMouseReport &rpt) {
   if (!tud_hid_n_ready(0)) return false;
@@ -185,9 +230,23 @@ static inline bool sendKbdDirect(const KbdPkt &k) {
   return tud_hid_n_report(0, rid, report, 8);
 }
 
+static inline bool sendConsumerDirect(uint16_t usage) {
+  if (!tud_hid_n_ready(0)) return false;
+  uint8_t rid = (tud_hid_n_get_protocol(0) == 0) ? 0 : CONSUMER_REPORT_ID;
+  return tud_hid_n_report(0, rid, &usage, sizeof(usage));
+}
+
+static inline bool sendAppleFnDirect(uint8_t state) {
+  if (!tud_hid_n_ready(0)) return false;
+  uint8_t report = state ? 0x01 : 0x00;
+  return tud_hid_n_report(0, APPLE_FN_REPORT_ID, &report, 1);
+}
+
 void usbTask(void *pvParameters) {
   MousePkt p;
   KbdPkt k;
+  uint16_t cu;
+  uint8_t fn;
   HIDMouseReport rpt;
   bool hasPending = false;
   MousePkt pending;
@@ -196,6 +255,8 @@ void usbTask(void *pvParameters) {
     if (hostSuspended) {
       xQueueReset(mouseQ);
       xQueueReset(kbdQ);
+      xQueueReset(consumerQ);
+      xQueueReset(appleFnQ);
       pendingActivate = false;
       pendingDeactivate = false;
       hasPending = false;
@@ -209,11 +270,14 @@ void usbTask(void *pvParameters) {
         deviceActive = false;
         UsbKbd.releaseAll();
         { HIDMouseReport rel = {}; sendMouseDirect(rel); }
-        UsbConsumer.release();
+        sendConsumerDirect(0);
+        sendAppleFnDirect(0);
         prevBtn = 0;
         hasPending = false;
         xQueueReset(mouseQ);
         xQueueReset(kbdQ);
+        xQueueReset(consumerQ);
+        xQueueReset(appleFnQ);
       }
     }
     if (pendingActivate) {
@@ -259,6 +323,14 @@ void usbTask(void *pvParameters) {
         } else if (xQueueReceive(mouseQ, &p, 0) == pdTRUE) {
         } else if (xQueueReceive(kbdQ, &k, 0) == pdTRUE) {
           sendKbdDirect(k);
+          hasActivity = true;
+          continue;
+        } else if (xQueueReceive(consumerQ, &cu, 0) == pdTRUE) {
+          sendConsumerDirect(cu);
+          hasActivity = true;
+          continue;
+        } else if (xQueueReceive(appleFnQ, &fn, 0) == pdTRUE) {
+          sendAppleFnDirect(fn);
           hasActivity = true;
           continue;
         } else {
@@ -336,6 +408,8 @@ void usbTask(void *pvParameters) {
       vTaskDelay(100);
       xQueueReset(mouseQ);
       xQueueReset(kbdQ);
+      xQueueReset(consumerQ);
+      xQueueReset(appleFnQ);
     } else {
       uint32_t millisNow = millis() - lastInputMs;
       if (millisNow > USB_IDLE_TIMEOUT_MS_4) {
@@ -359,6 +433,7 @@ void setup() {
   UsbMouse.begin();
   UsbKbd.begin();
   UsbConsumer.begin();
+  UsbAppleFn.begin();
 #if DEBUG_MODE
   DbgSerial.begin();
 #endif
@@ -367,6 +442,8 @@ void setup() {
 
   mouseQ = xQueueCreate(128, sizeof(MousePkt));
   kbdQ = xQueueCreate(32, sizeof(KbdPkt));
+  consumerQ = xQueueCreate(16, sizeof(uint16_t));
+  appleFnQ = xQueueCreate(8, sizeof(uint8_t));
 
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
@@ -420,6 +497,8 @@ void loop() {
       deviceActive = false;
       xQueueReset(mouseQ);
       xQueueReset(kbdQ);
+      xQueueReset(consumerQ);
+      xQueueReset(appleFnQ);
     }
     lastPacketMs = now;
 
@@ -447,6 +526,8 @@ void loop() {
       deviceActive = false;
       xQueueReset(mouseQ);
       xQueueReset(kbdQ);
+      xQueueReset(consumerQ);
+      xQueueReset(appleFnQ);
     }
     lastPacketMs = now;
     usbGoneSinceMs = 0;
@@ -472,6 +553,8 @@ void loop() {
     deviceActive = false;
     xQueueReset(mouseQ);
     xQueueReset(kbdQ);
+    xQueueReset(consumerQ);
+    xQueueReset(appleFnQ);
 
     esp_now_deinit();
     esp_wifi_set_channel(ESPNOW_CHAN, WIFI_SECOND_CHAN_NONE);

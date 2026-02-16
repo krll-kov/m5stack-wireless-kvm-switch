@@ -65,6 +65,7 @@ static const uint8_t KBD_XOR[7] = {0x4B,0x56,0x4D,0x53,0x77,0x31,0x7A};
 #define PKT_ACTIVATE 0x03
 #define PKT_DEACTIVATE 0x04
 #define PKT_CONSUMER 0x06
+#define PKT_APPLE_FN 0x07
 
 #pragma pack(push, 1)
 typedef struct {
@@ -560,28 +561,19 @@ void max3421Poll() {
 
   // ── Apple fn/lock from byte 8 ──
   // byte 8 bit 1 (0x02) = fn/globe, bit 3 (0x08) = lock screen
-  // fn is delayed 50ms so lock can suppress it. Lock is sent immediately.
   {
-    static bool prevRawFn = false, prevRawLock = false;
-    static uint32_t fnChangeMs = 0;
     static bool fnSentState = false, lockSentState = false;
 
     bool rawFn = appleRawFn;
     bool rawLock = appleRawLock;
 
-    if (rawFn != prevRawFn) {
-      fnChangeMs = millis();
-      prevRawFn = rawFn;
-    }
-    if (rawLock != prevRawLock) {
-      prevRawLock = rawLock;
-    }
-
     // Lock — send as Ctrl+Cmd+Q keyboard shortcut (macOS lock screen)
     if (rawLock && !lockSentState) {
       lockSentState = true;
-      // If fn consumer key is active, cancel it first so macOS doesn't get confused
+      // If fn is active, cancel both vendor fn and consumer so macOS doesn't get confused
       if (appleFnDown) {
+        uint8_t fnCancel[2] = {PKT_APPLE_FN, 0};
+        esp_now_send(activeMac(), fnCancel, 2);
         uint8_t cancel[3] = {PKT_CONSUMER, 0x00, 0x00};
         esp_now_send(activeMac(), cancel, 3);
         delay(10);
@@ -602,20 +594,19 @@ void max3421Poll() {
       lockSentState = false;
     }
 
-    // fn — 50ms debounce, suppressed when lock is held
+    // fn — suppressed when lock is held
     if (rawFn != fnSentState) {
-      if (rawLock) {
-        fnSentState = rawFn;
-        appleFnDown = rawFn;
-      } else if (millis() - fnChangeMs >= 50) {
-        fnSentState = rawFn;
-        appleFnDown = rawFn;
+      fnSentState = rawFn;
+      appleFnDown = rawFn;
+      if (!rawLock) {
+        // Apple vendor fn report
+        uint8_t fnPkt[2] = {PKT_APPLE_FN, rawFn ? (uint8_t)1 : (uint8_t)0};
+        esp_now_send(activeMac(), fnPkt, 2);
+        // Consumer globe key
         if (rawFn) {
-          // Press: always send globe
           uint8_t p[3] = {PKT_CONSUMER, 0x9D, 0x02};
           esp_now_send(activeMac(), p, 3);
         } else if (activeFkeyConsumer == 0) {
-          // Release: only if no F-key consumer is active (would cancel it)
           uint8_t p[3] = {PKT_CONSUMER, 0x00, 0x00};
           esp_now_send(activeMac(), p, 3);
         }
