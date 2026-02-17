@@ -373,20 +373,32 @@ echo "sessionui.rc configured."
 # ==========================================================
 echo "=== KDE global shortcuts ==="
 
-run_as_user kwriteconfig6 --file "$REAL_HOME/.config/kdeglobals" --group "StandardShortcuts" --key "SelectAll" "Ctrl+A; Ctrl+Shift+A"
-run_as_user kwriteconfig6 --file "$REAL_HOME/.config/kdeglobals" --group "StandardShortcuts" --key "Find" "Ctrl+F; Ctrl+Shift+F"
-run_as_user kwriteconfig6 --file "$REAL_HOME/.config/kdeglobals" --group "StandardShortcuts" --key "New" "Ctrl+N; Ctrl+Shift+N"
-run_as_user kwriteconfig6 --file "$REAL_HOME/.config/kdeglobals" --group "StandardShortcuts" --key "Close" "Ctrl+W; Ctrl+Shift+W"
-run_as_user kwriteconfig6 --file "$REAL_HOME/.config/kdeglobals" --group "StandardShortcuts" --key "Undo" "Ctrl+Z"
-run_as_user kwriteconfig6 --file "$REAL_HOME/.config/kdeglobals" --group "StandardShortcuts" --key "Redo" "Ctrl+Shift+Z"
-run_as_user kwriteconfig6 --file "$REAL_HOME/.config/kdeglobals" --group "StandardShortcuts" --key "Save" "Ctrl+S"
+run_as_user kwriteconfig6 --file "$REAL_HOME/.config/kdeglobals" --group "Shortcuts" --key "SelectAll" "Ctrl+A; Ctrl+Shift+A"
+run_as_user kwriteconfig6 --file "$REAL_HOME/.config/kdeglobals" --group "Shortcuts" --key "Find" "Ctrl+F; Ctrl+Shift+F"
+run_as_user kwriteconfig6 --file "$REAL_HOME/.config/kdeglobals" --group "Shortcuts" --key "New" "Ctrl+N; Ctrl+Shift+N"
+run_as_user kwriteconfig6 --file "$REAL_HOME/.config/kdeglobals" --group "Shortcuts" --key "Close" "Ctrl+W; Ctrl+Shift+W"
+run_as_user kwriteconfig6 --file "$REAL_HOME/.config/kdeglobals" --group "Shortcuts" --key "Undo" "Ctrl+Z"
+run_as_user kwriteconfig6 --file "$REAL_HOME/.config/kdeglobals" --group "Shortcuts" --key "Redo" "Ctrl+Shift+Z"
+run_as_user kwriteconfig6 --file "$REAL_HOME/.config/kdeglobals" --group "Shortcuts" --key "Save" "Ctrl+S"
 
 # Remove Copy/Paste/Cut overrides (CUA handles these universally)
-run_as_user kwriteconfig6 --file "$REAL_HOME/.config/kdeglobals" --group "StandardShortcuts" --key "Copy" --delete 2>/dev/null || true
-run_as_user kwriteconfig6 --file "$REAL_HOME/.config/kdeglobals" --group "StandardShortcuts" --key "Paste" --delete 2>/dev/null || true
-run_as_user kwriteconfig6 --file "$REAL_HOME/.config/kdeglobals" --group "StandardShortcuts" --key "Cut" --delete 2>/dev/null || true
+run_as_user kwriteconfig6 --file "$REAL_HOME/.config/kdeglobals" --group "Shortcuts" --key "Copy" --delete 2>/dev/null || true
+run_as_user kwriteconfig6 --file "$REAL_HOME/.config/kdeglobals" --group "Shortcuts" --key "Paste" --delete 2>/dev/null || true
+run_as_user kwriteconfig6 --file "$REAL_HOME/.config/kdeglobals" --group "Shortcuts" --key "Cut" --delete 2>/dev/null || true
 
 echo "KDE global shortcuts configured."
+
+# ==========================================================
+# 7. Dolphin: resolve shortcut conflicts
+#    Ctrl+Shift+A conflicts with Invert Selection (default)
+#    Ctrl+Shift+F conflicts with Open Preferred Search Tool (default)
+# ==========================================================
+echo "=== Dolphin shortcut conflicts ==="
+
+run_as_user kwriteconfig6 --file "$REAL_HOME/.config/dolphinrc" --group "Shortcuts" --key "invertSelection" "none"
+run_as_user kwriteconfig6 --file "$REAL_HOME/.config/dolphinrc" --group "Shortcuts" --key "openPreferredSearchTool" "none"
+
+echo "Dolphin conflicts resolved."
 
 # ==========================================================
 # Done
