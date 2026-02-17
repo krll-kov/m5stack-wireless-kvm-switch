@@ -5,7 +5,6 @@
 
 #include "USB.h"
 #include "USBHIDKeyboard.h"
-#include "USBHIDMouse.h"
 #include "USBHIDConsumerControl.h"
 #include "USBCDC.h"
 #include "freertos/queue.h"
@@ -43,7 +42,7 @@ static const uint8_t KBD_XOR[7] = {0x4B,0x56,0x4D,0x53,0x77,0x31,0x7A};
 #define BOOT_GRACE_MS       5000
 #define ESPNOW_TIMEOUT_MS   3400
 #define USB_GONE_REPLUG_MS  3000
-#define WAKE_REPLUG_MS      3000
+#define SLEEP_SETTLE_MS     3000
 
 #define USB_IDLE_TIMEOUT_MS_4 900000
 #define USB_IDLE_DELAY_MS_4   100
@@ -91,8 +90,68 @@ public:
   }
 };
 
+static const uint8_t mouseDesc16[] = {
+  0x05, 0x01,              // Usage Page (Generic Desktop)
+  0x09, 0x02,              // Usage (Mouse)
+  0xA1, 0x01,              // Collection (Application)
+    0x85, 0x02,            //   Report ID (2)
+    0x09, 0x01,            //   Usage (Pointer)
+    0xA1, 0x00,            //   Collection (Physical)
+      0x05, 0x09,          //     Usage Page (Button)
+      0x19, 0x01,          //     Usage Minimum (1)
+      0x29, 0x05,          //     Usage Maximum (5)
+      0x15, 0x00,          //     Logical Minimum (0)
+      0x25, 0x01,          //     Logical Maximum (1)
+      0x95, 0x05,          //     Report Count (5)
+      0x75, 0x01,          //     Report Size (1)
+      0x81, 0x02,          //     Input (Data, Variable, Absolute)
+      0x95, 0x01,          //     Report Count (1)
+      0x75, 0x03,          //     Report Size (3)
+      0x81, 0x01,          //     Input (Constant) - padding
+      0x05, 0x01,          //     Usage Page (Generic Desktop)
+      0x09, 0x30,          //     Usage (X)
+      0x09, 0x31,          //     Usage (Y)
+      0x16, 0x01, 0x80,    //     Logical Minimum (-32767)
+      0x26, 0xFF, 0x7F,    //     Logical Maximum (32767)
+      0x95, 0x02,          //     Report Count (2)
+      0x75, 0x10,          //     Report Size (16)
+      0x81, 0x06,          //     Input (Data, Variable, Relative)
+      0x09, 0x38,          //     Usage (Wheel)
+      0x15, 0x81,          //     Logical Minimum (-127)
+      0x25, 0x7F,          //     Logical Maximum (127)
+      0x95, 0x01,          //     Report Count (1)
+      0x75, 0x08,          //     Report Size (8)
+      0x81, 0x06,          //     Input (Data, Variable, Relative)
+      0x05, 0x0C,          //     Usage Page (Consumer)
+      0x0A, 0x38, 0x02,    //     Usage (AC Pan)
+      0x15, 0x81,          //     Logical Minimum (-127)
+      0x25, 0x7F,          //     Logical Maximum (127)
+      0x95, 0x01,          //     Report Count (1)
+      0x75, 0x08,          //     Report Size (8)
+      0x81, 0x06,          //     Input (Data, Variable, Relative)
+    0xC0,                  //   End Collection
+  0xC0                     // End Collection
+};
+
+class USBHIDMouse16 : public USBHIDDevice {
+  USBHID hid;
+public:
+  USBHIDMouse16() : hid() {
+    static bool initialized = false;
+    if (!initialized) {
+      initialized = true;
+      hid.addDevice(this, sizeof(mouseDesc16));
+    }
+  }
+  void begin() { hid.begin(); }
+  uint16_t _onGetDescriptor(uint8_t *dst) override {
+    memcpy(dst, mouseDesc16, sizeof(mouseDesc16));
+    return sizeof(mouseDesc16);
+  }
+};
+
 USBHIDKeyboard UsbKbd;
-USBHIDMouse UsbMouse;
+USBHIDMouse16 UsbMouse;
 USBHIDConsumerControl UsbConsumer;
 USBHIDAppleFn UsbAppleFn;
 #if DEBUG_MODE
@@ -111,8 +170,8 @@ struct KbdPkt {
 };
 struct HIDMouseReport {
   uint8_t buttons;
-  int8_t x;
-  int8_t y;
+  int16_t x;
+  int16_t y;
   int8_t wheel;
   int8_t pan;
 };
@@ -129,13 +188,14 @@ volatile bool pendingDeactivate = false;
 static uint8_t prevBtn = 0;
 
 static bool wasSuspended = false;
+static bool wakeReplugDone = false;
 static bool wasActiveBeforeSuspend = false;
 volatile bool hostSuspended = false;
 
 static uint32_t bootMs = 0;
 volatile uint32_t lastPacketMs = 0;
 static uint32_t usbGoneSinceMs = 0;
-static uint32_t wakeTransitionStart = 0;
+static uint32_t suspendStartMs = 0;
 static uint32_t lastInputMs = 0;
 
 #if DEBUG_MODE
@@ -317,27 +377,31 @@ void usbTask(void *pvParameters) {
 
         if (!ensureUsbAwake()) break;
 
+        if (xQueueReceive(kbdQ, &k, 0) == pdTRUE) {
+          sendKbdDirect(k);
+          hasActivity = true;
+          continue;
+        }
+        if (xQueueReceive(consumerQ, &cu, 0) == pdTRUE) {
+          sendConsumerDirect(cu);
+          hasActivity = true;
+          continue;
+        }
+        if (xQueueReceive(appleFnQ, &fn, 0) == pdTRUE) {
+          sendAppleFnDirect(fn);
+          hasActivity = true;
+          continue;
+        }
+
         if (hasPending) {
           p = pending;
           hasPending = false;
         } else if (xQueueReceive(mouseQ, &p, 0) == pdTRUE) {
-        } else if (xQueueReceive(kbdQ, &k, 0) == pdTRUE) {
-          sendKbdDirect(k);
-          hasActivity = true;
-          continue;
-        } else if (xQueueReceive(consumerQ, &cu, 0) == pdTRUE) {
-          sendConsumerDirect(cu);
-          hasActivity = true;
-          continue;
-        } else if (xQueueReceive(appleFnQ, &fn, 0) == pdTRUE) {
-          sendAppleFnDirect(fn);
-          hasActivity = true;
-          continue;
         } else {
           break;
         }
 
-        if (uxQueueMessagesWaiting(mouseQ) > 16) {
+        if (uxQueueMessagesWaiting(mouseQ) > 64) {
           MousePkt extra;
           while (xQueueReceive(mouseQ, &extra, 0) == pdTRUE) {
             p.btn = extra.btn;
@@ -351,8 +415,8 @@ void usbTask(void *pvParameters) {
         }
 
         rpt.buttons = p.btn;
-        rpt.x = (p.dx > 127) ? 127 : (p.dx < -127) ? -127 : (int8_t)p.dx;
-        rpt.y = (p.dy > 127) ? 127 : (p.dy < -127) ? -127 : (int8_t)p.dy;
+        rpt.x = p.dx;
+        rpt.y = p.dy;
         rpt.wheel = p.whl;
         rpt.pan = 0;
 
@@ -367,17 +431,6 @@ void usbTask(void *pvParameters) {
 #if DEBUG_MODE
         dbgUsbSends++;
 #endif
-
-        int16_t remDx = p.dx - (int16_t)rpt.x;
-        int16_t remDy = p.dy - (int16_t)rpt.y;
-        if (remDx != 0 || remDy != 0) {
-          pending.btn = p.btn;
-          pending.dx = remDx;
-          pending.dy = remDy;
-          pending.whl = 0;
-          hasPending = true;
-          break;
-        }
       }
     }
     if (hasActivity) lastInputMs = millis();
@@ -427,6 +480,14 @@ void usbTask(void *pvParameters) {
   }
 }
 
+static void reinitEspNow() {
+  esp_now_deinit();
+  esp_wifi_set_channel(ESPNOW_CHAN, WIFI_SECOND_CHAN_NONE);
+  if (esp_now_init() == ESP_OK) {
+    esp_now_register_recv_cb(onRecv);
+  }
+}
+
 void setup() {
   bootMs = millis();
 
@@ -471,22 +532,35 @@ void loop() {
     hostSuspended = false;
 
     if (wasSuspended) {
-      // Waking from sleep — give macOS time to re-enumerate
-      if (wakeTransitionStart == 0) {
-        wakeTransitionStart = now;
-        tud_remote_wakeup();
-      }
-
-      if (now - wakeTransitionStart > WAKE_REPLUG_MS) {
-        wakeTransitionStart = 0;
+      if (!wakeReplugDone) {
+        // Confirmed sleep → immediate replug + reinit
         tud_disconnect();
         vTaskDelay(pdMS_TO_TICKS(500));
         tud_connect();
+        reinitEspNow();
+        if (wasActiveBeforeSuspend) {
+          deviceActive = true;
+          lastInputMs = now;
+        }
+        wakeReplugDone = true;
         lastPacketMs = now;
         delay(200);
         return;
       }
+      // Already replugged — wait for Mac to enumerate
+      lastPacketMs = now;
+      delay(50);
+      return;
+    }
 
+    if (suspendStartMs != 0) {
+      // Brief bounce — restore without replug or reinit
+      if (wasActiveBeforeSuspend) {
+        deviceActive = true;
+        lastInputMs = now;
+      }
+      wasActiveBeforeSuspend = false;
+      suspendStartMs = 0;
       lastPacketMs = now;
       delay(50);
       return;
@@ -515,11 +589,14 @@ void loop() {
     return;
   }
 
-  // USB suspended by host
-  if (suspended) {
+  // USB suspended by host (skip during boot grace — enumeration can look like suspend)
+  if (suspended && !grace) {
     hostSuspended = true;
-    if (!wasSuspended) {
+    if (suspendStartMs == 0) {
+      suspendStartMs = now;
       wasActiveBeforeSuspend = deviceActive;
+    }
+    if (now - suspendStartMs >= SLEEP_SETTLE_MS) {
       wasSuspended = true;
     }
     if (deviceActive) {
@@ -540,8 +617,21 @@ void loop() {
   usbGoneSinceMs = 0;
 
   if (wasSuspended) {
+    if (!wakeReplugDone) {
+      // Woke up with USB still mounted — reinit ESP-NOW
+      reinitEspNow();
+    }
+    if (wasActiveBeforeSuspend && !deviceActive) {
+      deviceActive = true;
+      lastInputMs = millis();
+    }
     wasSuspended = false;
-    wakeTransitionStart = 0;
+    wakeReplugDone = false;
+    wasActiveBeforeSuspend = false;
+    suspendStartMs = 0;
+  } else if (suspendStartMs != 0) {
+    // Brief bounce — restore without reinit
+    suspendStartMs = 0;
     if (wasActiveBeforeSuspend) {
       deviceActive = true;
       lastInputMs = millis();
@@ -556,11 +646,7 @@ void loop() {
     xQueueReset(consumerQ);
     xQueueReset(appleFnQ);
 
-    esp_now_deinit();
-    esp_wifi_set_channel(ESPNOW_CHAN, WIFI_SECOND_CHAN_NONE);
-    if (esp_now_init() == ESP_OK) {
-      esp_now_register_recv_cb(onRecv);
-    }
+    reinitEspNow();
     lastPacketMs = now;
   }
 
