@@ -28,9 +28,6 @@ bool tud_cdc_n_write_flush(uint8_t itf);
 
 #define ESPNOW_CHAN 1
 
-// XOR key for keyboard payload obfuscation (must match CoreS3 SE)
-static const uint8_t KBD_XOR[7] = {0x4B,0x56,0x4D,0x53,0x77,0x31,0x7A};
-
 #define PKT_MOUSE 0x01
 #define PKT_KEYBOARD 0x02
 #define PKT_ACTIVATE 0x03
@@ -210,6 +207,26 @@ static volatile uint8_t  dbgMouseQPeak = 0;
 static volatile uint8_t  dbgKbdQPeak = 0;
 #endif
 
+#include <mbedtls/aes.h>
+
+// AES-128 key for keyboard encryption (must match CoreS3 SE targets[].aesKey)
+static const uint8_t AES_KEY[16] = {0x4B,0x56,0x4D,0x53,0x77,0x31,0x7A,0xDE,0xAD,0xBE,0xEF,0x42,0x13,0x37,0xCA,0xFE};
+
+static void aesCtrDecrypt(const uint8_t *key, const uint8_t *in, uint8_t *out, int payloadLen) {
+  // in[0..3] = counter, in[4..] = encrypted payload
+  uint8_t block[16] = {0};
+  memcpy(block, in, 4);
+  uint8_t keystream[16];
+
+  mbedtls_aes_context ctx;
+  mbedtls_aes_init(&ctx);
+  mbedtls_aes_setkey_enc(&ctx, key, 128);
+  mbedtls_aes_crypt_ecb(&ctx, MBEDTLS_AES_ENCRYPT, block, keystream);
+  mbedtls_aes_free(&ctx);
+
+  for (int i = 0; i < payloadLen; i++) out[i] = in[4 + i] ^ keystream[i];
+}
+
 void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (len < 1) return;
   lastPacketMs = millis();
@@ -235,9 +252,9 @@ void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
       }
       break;
     case PKT_KEYBOARD:
-      if (len >= 8) {
+      if (len >= 12) {
         uint8_t dec[7];
-        for (int i = 0; i < 7; i++) dec[i] = data[1 + i] ^ KBD_XOR[i];
+        aesCtrDecrypt(AES_KEY, &data[1], dec, 7);
         KbdPkt k;
         k.mod = dec[0];
         memcpy(k.keys, &dec[1], 6);
@@ -245,15 +262,18 @@ void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
       }
       break;
     case PKT_CONSUMER:
-      if (len >= 3 && deviceActive) {
-        uint16_t usage = data[1] | ((uint16_t)data[2] << 8);
+      if (len >= 7 && deviceActive) {
+        uint8_t dec[2];
+        aesCtrDecrypt(AES_KEY, &data[1], dec, 2);
+        uint16_t usage = dec[0] | ((uint16_t)dec[1] << 8);
         xQueueSend(consumerQ, &usage, 0);
       }
       break;
     case PKT_APPLE_FN:
-      if (len >= 2 && deviceActive) {
-        uint8_t fn = data[1];
-        xQueueSend(appleFnQ, &fn, 0);
+      if (len >= 6 && deviceActive) {
+        uint8_t dec[1];
+        aesCtrDecrypt(AES_KEY, &data[1], dec, 1);
+        xQueueSend(appleFnQ, &dec[0], 0);
       }
       break;
     case PKT_HEARTBEAT:

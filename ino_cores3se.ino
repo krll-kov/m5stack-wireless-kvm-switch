@@ -15,6 +15,7 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_wifi.h>
+#include <mbedtls/aes.h>
 
 #include "driver/temperature_sensor.h"
 #include "freertos/FreeRTOS.h"
@@ -31,15 +32,15 @@
 
 struct PCTarget {
   uint8_t mac[6];
-  uint8_t kbdXor[7];
-  uint8_t bindMask;  // mouse button bitmask: 0x08=btn4, 0x10=btn5, 0=none
+  uint8_t aesKey[16];  // AES-128 key for keyboard encryption
+  uint8_t bindMask;    // mouse button bitmask: 0x08=btn4, 0x10=btn5, 0=none
 };
 
 static const PCTarget targets[] = {
   // PC 1: mouse4
-  { {0x3C,0xDC,0x75,0xED,0xFB,0x4C}, {0x4B,0x56,0x4D,0x53,0x77,0x31,0x7A}, 0x08 },
+  {{0x3C,0xDC,0x75,0xED,0xFB,0x4C}, {0x4B,0x56,0x4D,0x53,0x77,0x31,0x7A,0xDE,0xAD,0xBE,0xEF,0x42,0x13,0x37,0xCA,0xFE}, 0x08},
   // PC 2: mouse5
-  { {0xD0,0xCF,0x13,0x0F,0x90,0x48}, {0x4B,0x56,0x4D,0x53,0x77,0x31,0x7A}, 0x10 },
+  {{0xD0,0xCF,0x13,0x0F,0x90,0x48}, {0x4B,0x56,0x4D,0x53,0x77,0x31,0x7A,0xDE,0xAD,0xBE,0xEF,0x42,0x13,0x37,0xCA,0xFE}, 0x10},
 };
 static const int targetCount = sizeof(targets) / sizeof(targets[0]);
 
@@ -274,9 +275,6 @@ static void onEspNowSendDone(const uint8_t *, esp_now_send_status_t) {}
 static const uint8_t *activeMac() {
   return targets[activeTarget].mac;
 }
-static const uint8_t *activeXor() {
-  return targets[activeTarget].kbdXor;
-}
 static void sendCmd(const uint8_t *mac, uint8_t cmd) { esp_now_send(mac, &cmd, 1); }
 static void switchToTarget(int newTarget) {
   if (newTarget < 0 || newTarget >= targetCount || newTarget == activeTarget) return;
@@ -314,13 +312,63 @@ static void txMouse(const mouse_evt_t *m) {
   dbgEspTx++;
 #endif
 }
+static uint32_t kbdAesCtr;  // initialized from esp_random() in setup()
+
+// AES-128-CTR encrypt: writes counter(4) + encrypted payload into `out`.
+// Returns total bytes written (4 + plainLen).
+static int aesCtrEncrypt(const uint8_t *key, const uint8_t *plain, int plainLen, uint8_t *out) {
+  uint32_t ctr = kbdAesCtr++;
+  out[0] = ctr & 0xFF;
+  out[1] = (ctr >> 8) & 0xFF;
+  out[2] = (ctr >> 16) & 0xFF;
+  out[3] = (ctr >> 24) & 0xFF;
+
+  uint8_t block[16] = {0};
+  memcpy(block, out, 4);  // counter as nonce
+  uint8_t keystream[16];
+
+  mbedtls_aes_context ctx;
+  mbedtls_aes_init(&ctx);
+  mbedtls_aes_setkey_enc(&ctx, key, 128);
+  mbedtls_aes_crypt_ecb(&ctx, MBEDTLS_AES_ENCRYPT, block, keystream);
+  mbedtls_aes_free(&ctx);
+
+  for (int i = 0; i < plainLen; i++) out[4 + i] = plain[i] ^ keystream[i];
+  return 4 + plainLen;
+}
+
 static void txKbd(const kbd_evt_t *k) {
-  uint8_t p[8] = {PKT_KEYBOARD, k->modifiers};
-  memcpy(&p[2], k->keys, 6);
-  for (int i = 0; i < 7; i++) p[1 + i] ^= targets[activeTarget].kbdXor[i];
+  uint8_t plain[7] = {k->modifiers};
+  memcpy(&plain[1], k->keys, 6);
+
+  uint8_t p[12];
+  p[0] = PKT_KEYBOARD;
+  aesCtrEncrypt(targets[activeTarget].aesKey, plain, 7, &p[1]);
+
   const uint8_t *dst = activeMac();
   for (int attempt = 0; attempt < 3; attempt++) {
-    if (esp_now_send(dst, p, 8) == ESP_OK) break;
+    if (esp_now_send(dst, p, 12) == ESP_OK) break;
+    taskYIELD();
+  }
+}
+
+static void txConsumer(uint16_t usage) {
+  uint8_t plain[2] = {(uint8_t)(usage & 0xFF), (uint8_t)(usage >> 8)};
+  uint8_t p[7];
+  p[0] = PKT_CONSUMER;
+  aesCtrEncrypt(targets[activeTarget].aesKey, plain, 2, &p[1]);
+  for (int attempt = 0; attempt < 3; attempt++) {
+    if (esp_now_send(activeMac(), p, 7) == ESP_OK) break;
+    taskYIELD();
+  }
+}
+
+static void txAppleFn(uint8_t fn) {
+  uint8_t p[6];
+  p[0] = PKT_APPLE_FN;
+  aesCtrEncrypt(targets[activeTarget].aesKey, &fn, 1, &p[1]);
+  for (int attempt = 0; attempt < 3; attempt++) {
+    if (esp_now_send(activeMac(), p, 6) == ESP_OK) break;
     taskYIELD();
   }
 }
@@ -394,12 +442,10 @@ public:
     // Consumer press/release tracking
     if (newConsumer != activeFkeyConsumer) {
       if (activeFkeyConsumer != 0) {
-        uint8_t rel[3] = {PKT_CONSUMER, 0x00, 0x00};
-        esp_now_send(activeMac(), rel, 3);
+        txConsumer(0);
       }
       if (newConsumer != 0) {
-        uint8_t p[3] = {PKT_CONSUMER, (uint8_t)(newConsumer & 0xFF), (uint8_t)(newConsumer >> 8)};
-        esp_now_send(activeMac(), p, 3);
+        txConsumer(newConsumer);
       }
       activeFkeyConsumer = newConsumer;
     }
@@ -446,8 +492,7 @@ public:
     Serial.printf("BT rpt 0x%02X len=%d: %02X %02X\n", rptId, len, buf[1], len >= 3 ? buf[2] : 0);
     if (len >= 3) {
       uint16_t usage = (uint16_t)buf[1] | ((uint16_t)buf[2] << 8);
-      uint8_t p[3] = {PKT_CONSUMER, (uint8_t)(usage & 0xFF), (uint8_t)(usage >> 8)};
-      esp_now_send(activeMac(), p, 3);
+      txConsumer(usage);
     }
   }
 };
@@ -584,10 +629,8 @@ void max3421Poll() {
       lockSentState = true;
       // If fn is active, cancel both vendor fn and consumer so macOS doesn't get confused
       if (appleFnDown) {
-        uint8_t fnCancel[2] = {PKT_APPLE_FN, 0};
-        esp_now_send(activeMac(), fnCancel, 2);
-        uint8_t cancel[3] = {PKT_CONSUMER, 0x00, 0x00};
-        esp_now_send(activeMac(), cancel, 3);
+        txAppleFn(0);
+        txConsumer(0);
         delay(10);
       }
       fnSentState = rawFn;  // suppress pending fn
@@ -612,15 +655,12 @@ void max3421Poll() {
       appleFnDown = rawFn;
       if (!rawLock) {
         // Apple vendor fn report
-        uint8_t fnPkt[2] = {PKT_APPLE_FN, rawFn ? (uint8_t)1 : (uint8_t)0};
-        esp_now_send(activeMac(), fnPkt, 2);
+        txAppleFn(rawFn ? 1 : 0);
         // Consumer globe key
         if (rawFn) {
-          uint8_t p[3] = {PKT_CONSUMER, 0x9D, 0x02};
-          esp_now_send(activeMac(), p, 3);
+          txConsumer(0x029D);
         } else if (activeFkeyConsumer == 0) {
-          uint8_t p[3] = {PKT_CONSUMER, 0x00, 0x00};
-          esp_now_send(activeMac(), p, 3);
+          txConsumer(0);
         }
       }
     }
@@ -2067,6 +2107,7 @@ void setup() {
   esp_wifi_set_ps(WIFI_PS_NONE);
   esp_now_init();
   esp_now_register_send_cb(onEspNowSendDone);
+  kbdAesCtr = esp_random();
   for (int i = 0; i < targetCount; i++) {
     esp_now_peer_info_t p = {};
     memcpy(p.peer_addr, targets[i].mac, 6);

@@ -447,7 +447,7 @@ Before uploading, **update these values** in the sketch:
 
 | Variable | Description | Example |
 |---|---|---|
-| `targets[]` | Array of PC targets: MAC, XOR key, bind button | See below |
+| `targets[]` | Array of PC targets: MAC, AES-128 key, bind button | See below |
 | `BLE_KBD_MATCH` | Part of your keyboard's BT name (no special chars) | `"Keyboard"` |
 | `USE_MAX_MODULE` | Set `true` if using the classic USB module | `false` |
 | `WITH_KEYBOARD` | Set `false` for mouse-only mode | `true` |
@@ -456,14 +456,14 @@ Before uploading, **update these values** in the sketch:
 
 #### PC Targets Configuration
 
-Each PC is defined as a `PCTarget` struct with its AtomS3U MAC address, XOR key, and switch bind button:
+Each PC is defined as a `PCTarget` struct with its AtomS3U MAC address, AES-128 key, and switch bind button:
 
 ```cpp
 static const PCTarget targets[] = {
-  // PC 1: AtomS3U MAC, XOR key, mouse button 4 (0x08) to switch
-  { {0x3C,0xDC,0x75,0xED,0xFB,0x4C}, {0x4B,0x56,0x4D,0x53,0x77,0x31,0x7A}, 0x08 },
-  // PC 2: AtomS3U MAC, XOR key, mouse button 5 (0x10) to switch
-  { {0xD0,0xCF,0x13,0x0F,0x90,0x48}, {0x4B,0x56,0x4D,0x53,0x77,0x31,0x7A}, 0x10 },
+  // PC 1: AtomS3U MAC, AES-128 key, mouse button 4 (0x08) to switch
+  {{0x3C,0xDC,0x75,0xED,0xFB,0x4C}, {0x4B,0x56,0x4D,0x53,0x77,0x31,0x7A,0xDE,0xAD,0xBE,0xEF,0x42,0x13,0x37,0xCA,0xFE}, 0x08},
+  // PC 2: AtomS3U MAC, AES-128 key, mouse button 5 (0x10) to switch
+  {{0xD0,0xCF,0x13,0x0F,0x90,0x48}, {0x4B,0x56,0x4D,0x53,0x77,0x31,0x7A,0xDE,0xAD,0xBE,0xEF,0x42,0x13,0x37,0xCA,0xFE}, 0x10},
 };
 ```
 
@@ -486,7 +486,7 @@ Each PC has its own switch bind (mouse button):
 | Mouse 5 (forward) | bit 4 | `0x10` |
 | Mouse 6 | bit 5 | `0x20` |
 
-> **Security:** Keyboard data is XOR-obfuscated over the air to prevent casual sniffing of keystrokes. Each PC can have its own XOR key — the XOR for each target must match the corresponding AtomS3U receiver. Mouse data is sent as unencrypted broadcast for maximum performance. **Change the default XOR keys to your own random 7 bytes in both `ino_cores3se.ino` and `ino_atoms3u.ino` — the values must match per PC.**
+> **Security:** Keyboard data is encrypted with AES-128-CTR (hardware-accelerated) over the air. Each PC has its own AES key — the key for each target must match the corresponding AtomS3U receiver. Mouse data is sent as unencrypted broadcast for maximum performance. **Generate your own random 16-byte keys and set them in both `ino_cores3se.ino` (`targets[].aesKey`) and `ino_atoms3u.ino` (`AES_KEY`) — the values must match per PC.** Using the same key for all PCs is fine but means a compromised key on one PC exposes all keyboard traffic.
 
 <details>
 <summary>📄 <b>CoreS3 SE Main Controller Sketch</b> — click to expand</summary>
