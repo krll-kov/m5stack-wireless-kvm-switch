@@ -2,7 +2,7 @@
 
 > Wireless keyboard & mouse KVM switch (**both IN and OUT**) based on M5Stack CoreS3 SE and Atom S3U — capable of handling a **1000 Hz wireless mouse** and **Bluetooth keyboard**.
 
-Switch between two PCs with a single mouse button press. No cables for peripherals, no lag.
+Switch between multiple PCs (2+) with a single mouse button press. No cables for peripherals, no lag.
 
 ---
 
@@ -447,18 +447,46 @@ Before uploading, **update these values** in the sketch:
 
 | Variable | Description | Example |
 |---|---|---|
-| `ATOM_MAC_1[]` | MAC of first Atom S3U | `{0x3C, 0xDC, 0x75, 0xED, 0xFB, 0x4C}` |
-| `ATOM_MAC_2[]` | MAC of second Atom S3U | `{0xD0, 0xCF, 0x13, 0x0F, 0x90, 0x48}` |
-| `KBD_XOR[7]` | **Must change!** XOR key for keyboard obfuscation (same in both sketches) | `{0x4B,0x56,0x4D,0x53,0x77,0x31,0x7A}` |
+| `targets[]` | Array of PC targets: MAC, XOR key, bind button | See below |
 | `BLE_KBD_MATCH` | Part of your keyboard's BT name (no special chars) | `"Keyboard"` |
 | `USE_MAX_MODULE` | Set `true` if using the classic USB module | `false` |
 | `WITH_KEYBOARD` | Set `false` for mouse-only mode | `true` |
 | `BLE_PROBE_MIN_RSSI` | Raise to `-80` if keyboard is far away | `-55` |
 | `DEBUG_MODE` | Set to true to see debug mode stats (USB poll rate, ESP-NOW send rate, queue depth) | `false` |
 
-> **Security:** Keyboard data is XOR-obfuscated over the air to prevent casual sniffing of keystrokes. Mouse data is sent as unencrypted broadcast for maximum performance. **Change the default `KBD_XOR` key to your own random 7 bytes in both `ino_cores3se.ino` and `ino_atoms3u.ino` — the values must match.**
+#### PC Targets Configuration
 
-> 💡 The switch button is bound to **Mouse4** (`m.buttons & 0x08`) by default.
+Each PC is defined as a `PCTarget` struct with its AtomS3U MAC address, XOR key, and switch bind button:
+
+```cpp
+static const PCTarget targets[] = {
+  // PC 1: AtomS3U MAC, XOR key, mouse button 4 (0x08) to switch
+  { {0x3C,0xDC,0x75,0xED,0xFB,0x4C}, {0x4B,0x56,0x4D,0x53,0x77,0x31,0x7A}, 0x08 },
+  // PC 2: AtomS3U MAC, XOR key, mouse button 5 (0x10) to switch
+  { {0xD0,0xCF,0x13,0x0F,0x90,0x48}, {0x4B,0x56,0x4D,0x53,0x77,0x31,0x7A}, 0x10 },
+};
+```
+
+To add more PCs, just add another line to the array.
+
+#### Bind Behavior
+
+Each PC has its own switch bind (mouse button):
+- Press the bind for **another** PC → switches to that PC directly
+- Press the bind for the **current** PC → cycles to next PC in the list
+- Example: on PC1 (bind=mouse4), press mouse5 → go to PC2; on PC2 (bind=mouse5), press mouse5 → go to PC1
+- M5 hardware button A always cycles to the next PC
+- Set `bindMask` to `0` for no bind (switch only via M5 button or other PC's bind)
+
+#### Mouse Button Bitmask Reference
+
+| Button | Bitmask | Hex |
+|---|---|---|
+| Mouse 4 (back) | bit 3 | `0x08` |
+| Mouse 5 (forward) | bit 4 | `0x10` |
+| Mouse 6 | bit 5 | `0x20` |
+
+> **Security:** Keyboard data is XOR-obfuscated over the air to prevent casual sniffing of keystrokes. Each PC can have its own XOR key — the XOR for each target must match the corresponding AtomS3U receiver. Mouse data is sent as unencrypted broadcast for maximum performance. **Change the default XOR keys to your own random 7 bytes in both `ino_cores3se.ino` and `ino_atoms3u.ino` — the values must match per PC.**
 
 <details>
 <summary>📄 <b>CoreS3 SE Main Controller Sketch</b> — click to expand</summary>
@@ -540,10 +568,9 @@ sudo systemctl start kvm-cdc.service
 │  (dongle) ──►│ CoreS3 SE          ┌──────────────┐
 │              │  ───────────────►  │  AtomS3U #2  │──── USB ──── PC 2
 │  Bluetooth   │      ESP-NOW       └──────────────┘
-│  Keyboard ──►│
+│  Keyboard ──►│                     ...2+ PCs
 └──────────────┘
-        │
-   [Mouse4] = Switch PC
+   [Mouse4] = PC 1 bind    [Mouse5] = PC 2 bind
 ```
 
 The CoreS3 SE acts as the central hub: it reads the USB mouse dongle and BLE keyboard, then forwards all HID events over ESP-NOW to whichever Atom S3U is currently active. Each Atom S3U appears as a standard USB keyboard + mouse to its host PC.

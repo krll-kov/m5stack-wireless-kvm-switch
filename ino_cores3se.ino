@@ -29,11 +29,19 @@
 // Set true to show poll-rate / queue / send-rate overlay
 #define DEBUG_MODE false
 
-uint8_t ATOM_MAC_1[] = {0x3C, 0xDC, 0x75, 0xED, 0xFB, 0x4C};
-uint8_t ATOM_MAC_2[] = {0xD0, 0xCF, 0x13, 0x0F, 0x90, 0x48};
+struct PCTarget {
+  uint8_t mac[6];
+  uint8_t kbdXor[7];
+  uint8_t bindMask;  // mouse button bitmask: 0x08=btn4, 0x10=btn5, 0=none
+};
 
-// XOR key for keyboard payload obfuscation (must match AtomS3U)
-static const uint8_t KBD_XOR[7] = {0x4B,0x56,0x4D,0x53,0x77,0x31,0x7A};
+static const PCTarget targets[] = {
+  // PC 1: mouse4
+  { {0x3C,0xDC,0x75,0xED,0xFB,0x4C}, {0x4B,0x56,0x4D,0x53,0x77,0x31,0x7A}, 0x08 },
+  // PC 2: mouse5
+  { {0xD0,0xCF,0x13,0x0F,0x90,0x48}, {0x4B,0x56,0x4D,0x53,0x77,0x31,0x7A}, 0x10 },
+};
+static const int targetCount = sizeof(targets) / sizeof(targets[0]);
 
 #define BLE_KBD_MATCH "Keyboard"
 #define ESPNOW_CHAN 1
@@ -88,7 +96,6 @@ static volatile int bleState = 0;
 static char bleFoundName[64] = "";
 static char bleStatusMsg[64] = "";
 static char bleConnAddr[20] = "";
-static esp_now_peer_info_t peer1 = {}, peer2 = {};
 static uint32_t lastSwitchMs = 0;
 static volatile bool needRedraw = false;
 static volatile int bleMatchReason = 0;
@@ -96,7 +103,7 @@ static volatile bool passkeyActive = false;
 static volatile uint32_t passkeyValue = 0, passkeyShownMs = 0;
 static volatile bool pairingSuccess = false, pairingDone = false;
 static volatile bool switchInProgress = false;
-static volatile bool switchRequest = false;
+static volatile int switchRequestTarget = -1;  // -1 = no request
 static NimBLEClient *pc = nullptr;
 
 static NimBLEAddress knownKbdAddr;
@@ -264,26 +271,31 @@ static int getTopByRssi(int *out, int maxOut) {
 
 // ===================== ESP-NOW =====================
 static void onEspNowSendDone(const uint8_t *, esp_now_send_status_t) {}
-static uint8_t *activeMac() {
-  return (activeTarget == 0) ? ATOM_MAC_1 : ATOM_MAC_2;
+static const uint8_t *activeMac() {
+  return targets[activeTarget].mac;
 }
-static uint8_t *inactiveMac() {
-  return (activeTarget == 0) ? ATOM_MAC_2 : ATOM_MAC_1;
+static const uint8_t *activeXor() {
+  return targets[activeTarget].kbdXor;
 }
-static void sendCmd(uint8_t *mac, uint8_t cmd) { esp_now_send(mac, &cmd, 1); }
-static void switchTarget() {
+static void sendCmd(const uint8_t *mac, uint8_t cmd) { esp_now_send(mac, &cmd, 1); }
+static void switchToTarget(int newTarget) {
+  if (newTarget < 0 || newTarget >= targetCount || newTarget == activeTarget) return;
   switchInProgress = true;
   vTaskDelay(pdMS_TO_TICKS(2));
   xQueueReset(mouseQueue);
-  sendCmd(activeMac(), PKT_DEACTIVATE);
-  activeTarget = 1 - activeTarget;
-  sendCmd(activeMac(), PKT_ACTIVATE);
+  for (int i = 0; i < targetCount; i++)
+    if (i != newTarget) sendCmd(targets[i].mac, PKT_DEACTIVATE);
+  activeTarget = newTarget;
+  sendCmd(targets[activeTarget].mac, PKT_ACTIVATE);
   delayMicroseconds(800);
-  sendCmd(activeMac(), PKT_ACTIVATE);
+  sendCmd(targets[activeTarget].mac, PKT_ACTIVATE);
   xQueueReset(mouseQueue);
   lastSwitchMs = millis();
   switchInProgress = false;
   needRedraw = true;
+}
+static void switchNext() {
+  switchToTarget((activeTarget + 1) % targetCount);
 }
 static const uint8_t broadcastMac[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
 static void txMouse(const mouse_evt_t *m) {
@@ -305,7 +317,7 @@ static void txMouse(const mouse_evt_t *m) {
 static void txKbd(const kbd_evt_t *k) {
   uint8_t p[8] = {PKT_KEYBOARD, k->modifiers};
   memcpy(&p[2], k->keys, 6);
-  for (int i = 0; i < 7; i++) p[1 + i] ^= KBD_XOR[i];
+  for (int i = 0; i < 7; i++) p[1 + i] ^= targets[activeTarget].kbdXor[i];
   const uint8_t *dst = activeMac();
   for (int attempt = 0; attempt < 3; attempt++) {
     if (esp_now_send(dst, p, 8) == ESP_OK) break;
@@ -895,10 +907,10 @@ void usbHostTask(void *) {
 // ===================== MOUSE SEND TASK =====================
 void mouseSendTask(void *) {
   mouse_evt_t m;
-  bool m4h = false;
+  uint8_t prevBindState = 0;
   while (true) {
     if (switchInProgress) {
-      m4h = false;
+      prevBindState = 0;
       vTaskDelay(pdMS_TO_TICKS(2));
       continue;
     }
@@ -911,11 +923,20 @@ void mouseSendTask(void *) {
 
     if (xQueueReceive(mouseQueue, &m, waitTicks) != pdTRUE) continue;
 
-    // Handle button 4 (device switch)
-    bool m4 = (m.buttons & 0x08);
-    if (m4 && !m4h && millis() - lastSwitchMs > SWITCH_DEBOUNCE_MS)
-      switchRequest = true;
-    m4h = m4;
+    // Handle per-PC bind buttons
+    for (int t = 0; t < targetCount; t++) {
+      uint8_t mask = targets[t].bindMask;
+      if (!mask) continue;
+      bool pressed = (m.buttons & mask);
+      bool wasPressed = (prevBindState & mask);
+      if (pressed && !wasPressed && millis() - lastSwitchMs > SWITCH_DEBOUNCE_MS) {
+        if (activeTarget == t)
+          switchRequestTarget = (t + 1) % targetCount;
+        else
+          switchRequestTarget = t;
+      }
+    }
+    prevBindState = m.buttons;
 
     txMouse(&m);
 #if DEBUG_MODE
@@ -1646,7 +1667,8 @@ static void drawUI() {
   d.setCursor(8, 6);
   d.setTextColor(WHITE);
   d.print("PC ");
-  d.setTextColor(activeTarget == 0 ? GREEN : CYAN);
+  static const uint16_t pcColors[] = { GREEN, CYAN, YELLOW, MAGENTA };
+  d.setTextColor(pcColors[activeTarget % 4]);
   d.printf("%d", activeTarget + 1);
 
   // Mouse indicator
@@ -2045,16 +2067,14 @@ void setup() {
   esp_wifi_set_ps(WIFI_PS_NONE);
   esp_now_init();
   esp_now_register_send_cb(onEspNowSendDone);
-  memcpy(peer1.peer_addr, ATOM_MAC_1, 6);
-  peer1.channel = ESPNOW_CHAN;
-  peer1.encrypt = false;
-  peer1.ifidx = WIFI_IF_STA;
-  esp_now_add_peer(&peer1);
-  memcpy(peer2.peer_addr, ATOM_MAC_2, 6);
-  peer2.channel = ESPNOW_CHAN;
-  peer2.encrypt = false;
-  peer2.ifidx = WIFI_IF_STA;
-  esp_now_add_peer(&peer2);
+  for (int i = 0; i < targetCount; i++) {
+    esp_now_peer_info_t p = {};
+    memcpy(p.peer_addr, targets[i].mac, 6);
+    p.channel = ESPNOW_CHAN;
+    p.encrypt = false;
+    p.ifidx = WIFI_IF_STA;
+    esp_now_add_peer(&p);
+  }
   // Broadcast peer for mouse data (no ACK wait)
   {
     esp_now_peer_info_t bp = {};
@@ -2075,11 +2095,12 @@ void setup() {
     rate_cfg.dcm = false;
     const uint8_t bcast[6] = {0xFF,0xFF,0xFF,0xFF,0xFF,0xFF};
     esp_now_set_peer_rate_config(bcast, &rate_cfg);
-    esp_now_set_peer_rate_config(ATOM_MAC_1, &rate_cfg);
-    esp_now_set_peer_rate_config(ATOM_MAC_2, &rate_cfg);
+    for (int i = 0; i < targetCount; i++)
+      esp_now_set_peer_rate_config(targets[i].mac, &rate_cfg);
   }
-  sendCmd(ATOM_MAC_1, PKT_ACTIVATE);
-  sendCmd(ATOM_MAC_2, PKT_DEACTIVATE);
+  sendCmd(targets[0].mac, PKT_ACTIVATE);
+  for (int i = 1; i < targetCount; i++)
+    sendCmd(targets[i].mac, PKT_DEACTIVATE);
 
   xTaskCreatePinnedToCore(usbHostTask, "USB", 8192, NULL, 10, NULL, 1);
   xTaskCreatePinnedToCore(mouseSendTask, "MOUSE", 4096, NULL, 9, NULL, 0);
@@ -2129,12 +2150,16 @@ void loop() {
   if (qn > dbgQPeak) dbgQPeak = qn;
 #endif
 
-  if ((M5.BtnA.wasPressed() || switchRequest) &&
+  if ((M5.BtnA.wasPressed() || switchRequestTarget >= 0) &&
       millis() - lastSwitchMs > SWITCH_DEBOUNCE_MS) {
     lastActivityMs = millis();
     lastPCSwitchMs = lastActivityMs;
-    switchRequest = false;
-    switchTarget();
+    if (switchRequestTarget >= 0) {
+      switchToTarget(switchRequestTarget);
+      switchRequestTarget = -1;
+    } else {
+      switchNext();
+    }
   }
 
   // Other touch buttons: just wake screen for 20s
@@ -2160,7 +2185,8 @@ void loop() {
 
   if (millis() - lastBeat > hbInterval) {
     sendCmd(activeMac(), PKT_ACTIVATE);
-    sendCmd(inactiveMac(), PKT_DEACTIVATE);
+    for (int i = 0; i < targetCount; i++)
+      if (i != activeTarget) sendCmd(targets[i].mac, PKT_DEACTIVATE);
     lastBeat = millis();
   }
 
