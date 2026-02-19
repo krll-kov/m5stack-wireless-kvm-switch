@@ -39,7 +39,7 @@ bool tud_cdc_n_write_flush(uint8_t itf);
 #define BOOT_GRACE_MS       5000
 #define ESPNOW_TIMEOUT_MS   3400
 #define USB_GONE_REPLUG_MS  3000
-#define SLEEP_SETTLE_MS     3000
+#define SLEEP_SETTLE_MS     7500
 
 #define USB_IDLE_TIMEOUT_MS_4 900000
 #define USB_IDLE_DELAY_MS_4   100
@@ -559,8 +559,7 @@ void loop() {
         tud_connect();
         reinitEspNow();
         if (wasActiveBeforeSuspend) {
-          deviceActive = true;
-          lastInputMs = now;
+          pendingActivate = true;  // let usbTask do proper HID init
         }
         wakeReplugDone = true;
         lastPacketMs = now;
@@ -642,8 +641,7 @@ void loop() {
       reinitEspNow();
     }
     if (wasActiveBeforeSuspend && !deviceActive) {
-      deviceActive = true;
-      lastInputMs = millis();
+      pendingActivate = true;  // let usbTask do proper HID init
     }
     wasSuspended = false;
     wakeReplugDone = false;
@@ -653,8 +651,7 @@ void loop() {
     // Brief bounce — restore without reinit
     suspendStartMs = 0;
     if (wasActiveBeforeSuspend) {
-      deviceActive = true;
-      lastInputMs = millis();
+      pendingActivate = true;  // let usbTask do proper HID init
     }
     wasActiveBeforeSuspend = false;
   }
