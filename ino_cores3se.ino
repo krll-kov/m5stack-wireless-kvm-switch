@@ -478,7 +478,7 @@ public:
     // Apple vendor report 0x90: fn/globe key — actual fn handled via byte 8, ignore here
     if (rptId == 0x90) return;
 
-    // Apple battery report 0xF0: sent periodically on interrupt channel
+    // Apple battery reports: 0xF0 (periodic) and 0x9B (device status)
     if (rptId == 0xF0 && len >= 4) {
       int pct = buf[3];
       if (pct >= 0 && pct <= 100 && pct != kbdBatteryPct) {
@@ -487,13 +487,21 @@ public:
       }
       return;
     }
-
-    // Forward all other reports as consumer keys (Apple consumer: media, etc.)
-    Serial.printf("BT rpt 0x%02X len=%d: %02X %02X\n", rptId, len, buf[1], len >= 3 ? buf[2] : 0);
-    if (len >= 3) {
-      uint16_t usage = (uint16_t)buf[1] | ((uint16_t)buf[2] << 8);
-      txConsumer(usage);
+    if (rptId == 0x9B && len >= 3) {
+      int pct = buf[2]; // byte 2 = battery percentage
+      if (pct >= 0 && pct <= 100 && pct != kbdBatteryPct) {
+        kbdBatteryPct = pct;
+        needRedraw = true;
+      }
+      return;
     }
+
+    // Log full unknown report for analysis (buffer to avoid serial interleave issues)
+    char hexbuf[128];
+    int pos = snprintf(hexbuf, sizeof(hexbuf), "BT rpt 0x%02X len=%u data(%d):", (unsigned)rptId, (unsigned)len, len - 1);
+    for (int i = 1; i < (int)len && pos < (int)sizeof(hexbuf) - 4; i++)
+      pos += snprintf(hexbuf + pos, sizeof(hexbuf) - pos, " %02X", (unsigned)buf[i]);
+    Serial.println(hexbuf);
   }
 };
 
@@ -548,15 +556,11 @@ void max3421Poll() {
       strncpy(bleFoundName, "Classic HID", sizeof(bleFoundName) - 1);
     bleState = 4;
     snprintf(maxStatusMsg, sizeof(maxStatusMsg), "classic HID!");
-    // Enter sniff immediately on connection — match current idle level
-    if (lastIdleLevel >= 4)
-      Btd.hci_sniff_mode(Btd.hci_handle, 800, 640, 2, 1);   // 500ms
-    else if (lastIdleLevel >= 3)
-      Btd.hci_sniff_mode(Btd.hci_handle, 320, 256, 2, 1);   // 200ms
-    else if (lastIdleLevel >= 1)
-      Btd.hci_sniff_mode(Btd.hci_handle, 80, 64, 4, 1);     // 50ms
-    else
-      Btd.hci_sniff_mode(Btd.hci_handle, 16, 16, 4, 1);     // 10ms active
+    // Allow sniff + role switch in link policy so the keyboard can negotiate
+    // its own power saving (like macOS). Don't send hci_sniff_mode() — that
+    // returns Command Status which never re-sets HCI_FLAG_CMD_COMPLETE,
+    // breaking the BTD state machine. The keyboard manages sniff itself.
+    Btd.hci_write_link_policy(Btd.hci_handle, 0x05); // bit0=role switch, bit2=sniff
     Serial.println("BTHID connected");
     needRedraw = true;
   } else if (!connected && wasConnected) {
@@ -707,11 +711,6 @@ static uint32_t xferDeadMs = 0;
 static volatile uint32_t lastXferCbMs = 0;
 static int recoverFails = 0;
 static volatile bool usbResetRequest = false;
-static volatile bool mouseIdleSuspended = false;
-static uint32_t mouseIdlePollMs = 0;
-#define MOUSE_IDLE_POLL_INTERVAL_MS 500   // wake-check every 500ms during idle
-#define MOUSE_IDLE_POLL_WINDOW_MS  20    // poll window per check (dongle buffers data)
-
 static bool findHidEp();
 
 static void mouseXferCb(usb_transfer_t *xfer) {
@@ -943,66 +942,7 @@ void usbHostTask(void *) {
       }
     }
 
-    // ── Mouse idle suspend: stop USB polling so dongle + mouse can sleep ──
-    if (il >= 3 && !mouseIdleSuspended && usbMouseReady && usbDev && epAddr) {
-      for (int i = 0; i < 2; i++) {
-        if (xfers[i]) {
-          usb_host_transfer_free(xfers[i]);
-          xfers[i] = NULL;
-        }
-      }
-      usb_host_interface_release(usbClient, usbDev, hidIfNum);
-      epAddr = 0;
-      mouseIdleSuspended = true;
-      usbMouseReady = false;
-      xferDead = false;
-      xferDeadMs = 0;
-      mouseIdlePollMs = millis();
-      needRedraw = true;
-    }
-
-    // Periodic wake-check: briefly re-enable USB to detect mouse movement
-    if (mouseIdleSuspended && usbDev && (millis() - mouseIdlePollMs >= MOUSE_IDLE_POLL_INTERVAL_MS)) {
-      mouseIdlePollMs = millis();
-      if (findHidEp()) {
-        usbMouseReady = true;
-        // Poll briefly — if mouse moved, mouseXferCb fires and updates lastActivityMs
-        for (int w = 0; w < MOUSE_IDLE_POLL_WINDOW_MS; w++) {
-          usb_host_lib_handle_events(1, NULL);
-          usb_host_client_handle_events(usbClient, 0);
-        }
-        if (idleLevel() < 3) {
-          // Mouse moved! Stay resumed.
-          mouseIdleSuspended = false;
-          recoverFails = 0;
-          needRedraw = true;
-        } else {
-          // No activity — go back to sleep
-          for (int i = 0; i < 2; i++) {
-            if (xfers[i]) {
-              usb_host_transfer_free(xfers[i]);
-              xfers[i] = NULL;
-            }
-          }
-          usb_host_interface_release(usbClient, usbDev, hidIfNum);
-          epAddr = 0;
-          usbMouseReady = false;
-        }
-      }
-    }
-
-    // Resume from idle when other activity detected (keyboard/touch)
-    if (il < 3 && mouseIdleSuspended && usbDev) {
-      vTaskDelay(pdMS_TO_TICKS(50));
-      if (findHidEp()) {
-        usbMouseReady = true;
-        recoverFails = 0;
-        needRedraw = true;
-      }
-      mouseIdleSuspended = false;
-    }
-
-    if (usbDev && !epAddr && !mouseIdleSuspended) {
+    if (usbDev && !epAddr) {
       vTaskDelay(pdMS_TO_TICKS(200));
       if (findHidEp()) {
         usbMouseReady = true;
@@ -1405,8 +1345,8 @@ static bool bleDoConnect() {
         // 5min idle → medium: ~300ms effective
         c->updateConnParams(40, 80, 6, 600);   // 50-100ms interval, skip 6
       } else if (il == 4 && prevBleIdle != 4) {
-        // 15min idle → deep: ~800ms effective
-        c->updateConnParams(80, 160, 8, 600);  // 100-200ms interval, skip 8
+        // 15min idle → deep: ~1s worst-case wake (latency 4 × 200ms)
+        c->updateConnParams(80, 160, 4, 600);  // 100-200ms interval, skip 4
       }
       prevBleIdle = il;
 
@@ -2315,6 +2255,12 @@ void loop() {
     case 1: hbInterval = IDLE1_HEARTBEAT_MS; loopDelay = IDLE1_LOOP_MS; break;
     default: hbInterval = HEARTBEAT_MS; loopDelay = 1; break;
   }
+#if USE_MAX_MODULE
+  // MAX3421E has tiny internal buffer — must poll often enough to avoid
+  // HCI event overflow which causes BT disconnect during idle.
+  if (mxClassicConnected && loopDelay > 20)
+    loopDelay = 20;
+#endif
 
   if (millis() - lastBeat > hbInterval) {
     sendCmd(activeMac(), PKT_ACTIVATE);
@@ -2385,26 +2331,11 @@ void loop() {
         }
       }
 
-      // ── Classic BT sniff mode — save keyboard battery ──
-      // Intervals in 0.625ms units. attempt/timeout in 1.25ms units.
-      // Always in sniff (like macOS). Deeper sniff at higher idle levels.
-#if USE_MAX_MODULE
-      if (mxClassicConnected && bthid.connected) {
-        if (idlelvl == 0 && prevIdle >= 1) {
-          // Active typing → 10ms sniff (~8x savings, <10ms latency — imperceptible)
-          Btd.hci_sniff_mode(Btd.hci_handle, 16, 16, 4, 1);
-        } else if (idlelvl >= 1 && idlelvl < 3 && (prevIdle == 0 || prevIdle >= 3)) {
-          // 10s idle → 50ms sniff, ~20x savings
-          Btd.hci_sniff_mode(Btd.hci_handle, 80, 64, 4, 1);
-        } else if (idlelvl == 3 && prevIdle != 3) {
-          // 5min idle → 200ms sniff, ~80x savings
-          Btd.hci_sniff_mode(Btd.hci_handle, 320, 256, 2, 1);
-        } else if (idlelvl == 4 && prevIdle != 4) {
-          // 15min idle → 500ms sniff, ~200x savings
-          Btd.hci_sniff_mode(Btd.hci_handle, 800, 640, 2, 1);
-        }
-      }
-#endif
+      // Classic BT sniff: not managed here. The keyboard/dongle negotiate
+      // sniff mode automatically. Manual HCI_Sniff_Mode fails with 0x0C
+      // (Command Disallowed) and HCI_Command() clears CMD_COMPLETE flag
+      // which is never re-set by EV_COMMAND_STATUS, breaking the BTD
+      // state machine.
 
       // BLE keyboard idle conn params handled in bleDoConnect() loop
   }

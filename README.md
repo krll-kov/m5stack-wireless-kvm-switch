@@ -142,8 +142,9 @@ After installing the library, modify these files in your Arduino libraries folde
 
 **SSP (Secure Simple Pairing) for Apple keyboards (2 files):**
 
-4. **`BTD.h`** — add two event defines (after the existing `EV_` defines, around line 110):
+4. **`BTD.h`** — add event defines (after the existing `EV_` defines, around line 110):
    ```cpp
+   #define EV_MODE_CHANGE                                  0x14
    #define EV_USER_PASSKEY_REQUEST                         0x34
    #define EV_USER_PASSKEY_NOTIFICATION                    0x3B
    ```
@@ -365,40 +366,9 @@ After installing the library, modify these files in your Arduino libraries folde
     if(l2capinbuf[8] == 0xA3 || l2capinbuf[8] == 0xA1) {
     ```
 
-11. **`BTD.h`** — add sniff mode declarations (in the `public:` section, after `hci_write_class_of_device()`):
-    ```cpp
-    void hci_sniff_mode(uint16_t handle, uint16_t max_interval, uint16_t min_interval, uint16_t attempt, uint16_t timeout);
-    void hci_exit_sniff_mode(uint16_t handle);
-    ```
+11. **`BTD.h`** and **`BTD.cpp`** — added `hci_write_link_policy()` (and `hci_sniff_mode` / `hci_exit_sniff_mode` for reference). Only `hci_write_link_policy` is called from the firmware — it sets the link policy to allow sniff + role switch (0x05) so the keyboard can negotiate its own power saving, just like macOS. The `hci_sniff_mode()` command is NOT called because it returns `Command Status` (not `Command Complete`), which never re-sets `HCI_FLAG_CMD_COMPLETE`, breaking the BTD state machine.
 
-12. **`BTD.cpp`** — add sniff mode implementations (after `hci_write_class_of_device()`):
-    ```cpp
-    void BTD::hci_sniff_mode(uint16_t handle, uint16_t max_interval, uint16_t min_interval, uint16_t attempt, uint16_t timeout) {
-            hcibuf[0] = 0x03; // HCI OCF = 0x03 (Sniff Mode)
-            hcibuf[1] = 0x02 << 2; // HCI OGF = 0x02 (Link Policy)
-            hcibuf[2] = 0x0A; // parameter length = 10
-            hcibuf[3] = (uint8_t)(handle & 0xFF);
-            hcibuf[4] = (uint8_t)((handle >> 8) & 0x0F);
-            hcibuf[5] = (uint8_t)(max_interval & 0xFF);
-            hcibuf[6] = (uint8_t)(max_interval >> 8);
-            hcibuf[7] = (uint8_t)(min_interval & 0xFF);
-            hcibuf[8] = (uint8_t)(min_interval >> 8);
-            hcibuf[9] = (uint8_t)(attempt & 0xFF);
-            hcibuf[10] = (uint8_t)(attempt >> 8);
-            hcibuf[11] = (uint8_t)(timeout & 0xFF);
-            hcibuf[12] = (uint8_t)(timeout >> 8);
-            HCI_Command(hcibuf, 13);
-    }
-
-    void BTD::hci_exit_sniff_mode(uint16_t handle) {
-            hcibuf[0] = 0x04; // HCI OCF = 0x04 (Exit Sniff Mode)
-            hcibuf[1] = 0x02 << 2; // HCI OGF = 0x02 (Link Policy)
-            hcibuf[2] = 0x02; // parameter length = 2
-            hcibuf[3] = (uint8_t)(handle & 0xFF);
-            hcibuf[4] = (uint8_t)((handle >> 8) & 0x0F);
-            HCI_Command(hcibuf, 5);
-    }
-    ```
+12. **`BTD.cpp`** — added `EV_MODE_CHANGE` (0x14) event handler. Logs sniff/active mode transitions and interval under `DEBUG_USB_HOST`. The event mask already enables bit 19 (Mode Change) via the existing `0xFF` bytes.
 
 ---
 
@@ -549,10 +519,10 @@ https://github.com/krll-kov/m5stack-wireless-kvm-switch/blob/main/ino_cores3se.i
 |---|---|
 | **Mouse lag during BT scan** | The device has a single radio module shared between ESP-NOW (mouse) and BLE (keyboard). Lag stops once keyboard pairing completes. |
 | **Security PIN prompt** | Some keyboards require entering a 6-digit PIN displayed on the CoreS3 screen. |
-| **First input delay after idle** | The device enters power-saving mode after inactivity (10 sec = 1ms delay, 1 minute = 20ms delay, 5 min = 50ms delay, 15 min = 100ms delay). The first mouse movement after wake may feel slightly delayed. After 5 min idle, mouse USB polling is suspended (dongle + mouse can sleep to save battery) and checked every 2 seconds — mouse may take up to 2 sec to respond on first movement. Classic BT keyboards enter sniff mode (50ms/200ms/500ms intervals at 10s/5m/15m idle) and BLE keyboards use relaxed connection parameters. All power-saving is transparent and reverts to full speed on activity. |
+| **First input delay after idle** | The device enters power-saving mode after inactivity (10 sec = 1ms delay, 1 minute = 20ms delay, 5 min = 50ms delay, 15 min = 100ms delay). The first mouse movement after wake may feel slightly delayed. Mouse USB polling remains active at all idle levels (USB SOF keeps the dongle awake, and submitted transfers cost nothing when idle — NAK is handled in hardware). Classic BT keyboards negotiate sniff mode automatically with the dongle (enabled by setting link policy to allow sniff + role switch after connection). BLE keyboards use relaxed connection parameters at higher idle levels. All power-saving is transparent and reverts to full speed on activity. |
 | **Mouse rate** | Mouse events are forwarded 1:1 at the native poll rate of your mouse (tested up to 1000Hz). ESP-NOW uses 6.5 Mbps HT20 PHY for sufficient wireless throughput, and the AtomS3U uses non-blocking USB sends to avoid frame-alignment bottlenecks. On Linux, the CDC serial port must be kept open for full speed — see [Linux setup](#-linux-host-setup-required). |
 | **Apple fn/Globe key — dictation popup** | The fn (Globe) key is forwarded as a consumer control key (usage 0x029D). A quick tap while typing may trigger the macOS "Enable Dictation?" dialog. To fix: go to **System Settings → Keyboard → Dictation** and turn it off, or change **"Press fn key to"** to "Change Input Source". You also have to select "Start Dictation - Press twice" and in bottom section change the shortcut to microphone, then switch back to "Change Input Source" |
-| **Battery status does not update** | If you don't use debug mode, the only way to update the screen is to press mouse4 to switch pc or to plug-out/in mouse dongle, this is made for performance reasons. Also if you charge with battery base - we can't get the voltage and other info directly with code so we measure it by taking periodic battery samples |
+| **Battery status does not update** | If you don't use debug mode, the only way to update the screen is to press mouse4 to switch pc or to plug-out/in mouse dongle, this is made for performance reasons. Also if you charge with battery base - we can't get the voltage and other info directly with code so we measure it by taking periodic battery samples. Apple keyboard battery is read from two HID reports: 0xF0 (periodic battery report) and 0x9B (device status report, byte 2 = battery %). |
 | **Screen goes black** | This is done because of power efficiency - screen is only displayed during setup/pc switch (10sec here), without it battery will drain faster than it's charing from battery bottom |
 
 ---

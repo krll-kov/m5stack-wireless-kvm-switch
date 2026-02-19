@@ -96,6 +96,7 @@
 #define EV_COMMAND_STATUS                               0x0F
 #define EV_ROLE_CHANGED                                 0x12
 #define EV_NUM_COMPLETE_PKT                             0x13
+#define EV_MODE_CHANGE                                  0x14
 #define EV_PIN_CODE_REQUEST                             0x16
 #define EV_LINK_KEY_REQUEST                             0x17
 #define EV_LINK_KEY_NOTIFICATION                        0x18
@@ -403,6 +404,12 @@ public:
         void hci_connect(uint8_t *bdaddr);
         /** Used to a set the class of the device. */
         void hci_write_class_of_device();
+
+        /**
+         * Enable sniff mode in link policy for a connection.
+         * Must be called before hci_sniff_mode().
+         */
+        void hci_write_link_policy(uint16_t handle, uint16_t policy);
 
         /**
          * Enter sniff mode to save remote device battery.

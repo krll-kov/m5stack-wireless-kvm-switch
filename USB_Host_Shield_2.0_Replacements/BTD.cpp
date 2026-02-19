@@ -817,6 +817,18 @@ void BTD::HCI_event_task() {
                                 }
                                 break;
 
+                        case EV_MODE_CHANGE:
+#ifdef DEBUG_USB_HOST
+                                Notify(PSTR("\r\nMode Change: status="), 0x80);
+                                D_PrintHex<uint8_t>(hcibuf[2], 0x80);
+                                Notify(PSTR(" mode="), 0x80);
+                                D_PrintHex<uint8_t>(hcibuf[5], 0x80);  // 0=Active, 1=Hold, 2=Sniff, 3=Park
+                                Notify(PSTR(" interval="), 0x80);
+                                D_PrintHex<uint8_t>(hcibuf[7], 0x80);
+                                D_PrintHex<uint8_t>(hcibuf[6], 0x80);  // LE uint16, print MSB first
+#endif
+                                break;
+
                         case EV_ROLE_CHANGED:
                         case EV_PAGE_SCAN_REP_MODE:
                         case EV_LOOPBACK_COMMAND:
@@ -1546,6 +1558,18 @@ void BTD::hci_write_class_of_device() { // See http://bluetooth-pentest.narod.ru
         hcibuf[5] = 0x00;
 
         HCI_Command(hcibuf, 6);
+}
+
+void BTD::hci_write_link_policy(uint16_t handle, uint16_t policy) {
+        hcibuf[0] = 0x0D; // HCI OCF = 0x0D (Write_Link_Policy_Settings)
+        hcibuf[1] = 0x02 << 2; // HCI OGF = 0x02 (Link Policy)
+        hcibuf[2] = 0x04; // parameter length = 4
+        hcibuf[3] = (uint8_t)(handle & 0xFF);
+        hcibuf[4] = (uint8_t)((handle >> 8) & 0x0F);
+        hcibuf[5] = (uint8_t)(policy & 0xFF);
+        hcibuf[6] = (uint8_t)(policy >> 8);
+
+        HCI_Command(hcibuf, 7);
 }
 
 void BTD::hci_sniff_mode(uint16_t handle, uint16_t max_interval, uint16_t min_interval, uint16_t attempt, uint16_t timeout) {
