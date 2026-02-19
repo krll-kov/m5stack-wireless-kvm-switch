@@ -102,6 +102,7 @@
 #define EV_LINK_KEY_NOTIFICATION                        0x18
 #define EV_DATA_BUFFER_OVERFLOW                         0x1A
 #define EV_MAX_SLOTS_CHANGE                             0x1B
+#define EV_SNIFF_SUBRATING                              0x2E
 #define EV_LOOPBACK_COMMAND                             0x19
 #define EV_PAGE_SCAN_REP_MODE                           0x20
 #define EV_READ_REMOTE_EXTENDED_FEATURES_COMPLETE       0x23
@@ -418,6 +419,8 @@ public:
         void hci_sniff_mode(uint16_t handle, uint16_t max_interval, uint16_t min_interval, uint16_t attempt, uint16_t timeout);
         /** Exit sniff mode and return to active mode. */
         void hci_exit_sniff_mode(uint16_t handle);
+        /** Enable sniff subrating — allows skipping sniff slots when idle. */
+        void hci_sniff_subrating(uint16_t handle, uint16_t max_latency, uint16_t min_remote_timeout, uint16_t min_local_timeout);
         /**@}*/
 
         /** @name L2CAP Commands */

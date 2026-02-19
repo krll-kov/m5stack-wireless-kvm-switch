@@ -473,7 +473,19 @@ void BTD::HCI_event_task() {
                                                 for(uint8_t i = 0; i < 6; i++)
                                                         my_bdaddr[i] = hcibuf[6 + i];
                                                 hci_set_flag(HCI_FLAG_READ_BDADDR);
+                                        } else if((hcibuf[3] == 0x11) && (hcibuf[4] == 0x08)) { // Sniff Subrating accepted
+#ifdef DEBUG_USB_HOST
+                                                Notify(PSTR("\r\nSniff Subrating enabled"), 0x80);
+#endif
                                         }
+                                } else {
+#ifdef DEBUG_USB_HOST
+                                        Notify(PSTR("\r\nHCI Cmd Failed: op="), 0x80);
+                                        D_PrintHex<uint8_t>(hcibuf[4], 0x80);
+                                        D_PrintHex<uint8_t>(hcibuf[3], 0x80);
+                                        Notify(PSTR(" status="), 0x80);
+                                        D_PrintHex<uint8_t>(hcibuf[5], 0x80);
+#endif
                                 }
                                 break;
 
@@ -826,6 +838,19 @@ void BTD::HCI_event_task() {
                                 Notify(PSTR(" interval="), 0x80);
                                 D_PrintHex<uint8_t>(hcibuf[7], 0x80);
                                 D_PrintHex<uint8_t>(hcibuf[6], 0x80);  // LE uint16, print MSB first
+#endif
+                                break;
+
+                        case EV_SNIFF_SUBRATING:
+#ifdef DEBUG_USB_HOST
+                                Notify(PSTR("\r\nSniff Subrating: status="), 0x80);
+                                D_PrintHex<uint8_t>(hcibuf[2], 0x80);
+                                Notify(PSTR(" maxTxLat="), 0x80);
+                                D_PrintHex<uint8_t>(hcibuf[6], 0x80);
+                                D_PrintHex<uint8_t>(hcibuf[5], 0x80);
+                                Notify(PSTR(" maxRxLat="), 0x80);
+                                D_PrintHex<uint8_t>(hcibuf[8], 0x80);
+                                D_PrintHex<uint8_t>(hcibuf[7], 0x80);
 #endif
                                 break;
 
@@ -1341,7 +1366,7 @@ void BTD::hci_set_event_mask() {
         hcibuf[5] = 0xFF;
         hcibuf[6] = 0xFF;
         hcibuf[7] = 0xFF;
-        hcibuf[8] = 0x1F;
+        hcibuf[8] = 0x3F; // 0x1F default + bit5 for EV_SNIFF_SUBRATING (0x2E)
         hcibuf[9] = 0xFF; // Enable bits 48-55 used for simple pairing
         hcibuf[10] = 0x00;
 
@@ -1598,6 +1623,22 @@ void BTD::hci_exit_sniff_mode(uint16_t handle) {
         hcibuf[4] = (uint8_t)((handle >> 8) & 0x0F);
 
         HCI_Command(hcibuf, 5);
+}
+
+void BTD::hci_sniff_subrating(uint16_t handle, uint16_t max_latency, uint16_t min_remote_timeout, uint16_t min_local_timeout) {
+        hcibuf[0] = 0x11; // HCI OCF = 0x11 (Sniff_Subrating)
+        hcibuf[1] = 0x02 << 2; // HCI OGF = 0x02 (Link Policy)
+        hcibuf[2] = 0x08; // parameter length = 8
+        hcibuf[3] = (uint8_t)(handle & 0xFF);
+        hcibuf[4] = (uint8_t)((handle >> 8) & 0x0F);
+        hcibuf[5] = (uint8_t)(max_latency & 0xFF);
+        hcibuf[6] = (uint8_t)(max_latency >> 8);
+        hcibuf[7] = (uint8_t)(min_remote_timeout & 0xFF);
+        hcibuf[8] = (uint8_t)(min_remote_timeout >> 8);
+        hcibuf[9] = (uint8_t)(min_local_timeout & 0xFF);
+        hcibuf[10] = (uint8_t)(min_local_timeout >> 8);
+
+        HCI_Command(hcibuf, 11);
 }
 /*******************************************************************
  *                                                                 *

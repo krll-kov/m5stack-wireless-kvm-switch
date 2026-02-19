@@ -557,10 +557,11 @@ void max3421Poll() {
     bleState = 4;
     snprintf(maxStatusMsg, sizeof(maxStatusMsg), "classic HID!");
     // Allow sniff + role switch in link policy so the keyboard can negotiate
-    // its own power saving (like macOS). Don't send hci_sniff_mode() — that
-    // returns Command Status which never re-sets HCI_FLAG_CMD_COMPLETE,
-    // breaking the BTD state machine. The keyboard manages sniff itself.
+    // its own power saving (like macOS). The keyboard enters sniff mode
+    // automatically (~15ms interval). SSR enables deeper sleep by skipping
+    // sniff slots when idle — silently ignored if dongle doesn't support it.
     Btd.hci_write_link_policy(Btd.hci_handle, 0x05); // bit0=role switch, bit2=sniff
+    Btd.hci_sniff_subrating(Btd.hci_handle, 0x0000, 0x0000, 0x0000); // no constraints
     Serial.println("BTHID connected");
     needRedraw = true;
   } else if (!connected && wasConnected) {
