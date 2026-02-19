@@ -363,8 +363,14 @@ void usbTask(void *pvParameters) {
     if (pendingActivate) {
       pendingActivate = false;
       if (!deviceActive) {
+        xQueueReset(mouseQ);
+        xQueueReset(kbdQ);
+        xQueueReset(consumerQ);
+        xQueueReset(appleFnQ);
         UsbKbd.releaseAll();
         { HIDMouseReport rel = {}; sendMouseDirect(rel); }
+        sendConsumerDirect(0);
+        sendAppleFnDirect(0);
         prevBtn = 0;
         hasPending = false;
         deviceActive = true;
@@ -559,6 +565,7 @@ void loop() {
         tud_connect();
         reinitEspNow();
         if (wasActiveBeforeSuspend) {
+          deviceActive = false;
           pendingActivate = true;  // let usbTask do proper HID init
         }
         wakeReplugDone = true;
@@ -575,8 +582,8 @@ void loop() {
     if (suspendStartMs != 0) {
       // Brief bounce — restore without replug or reinit
       if (wasActiveBeforeSuspend) {
-        deviceActive = true;
-        lastInputMs = now;
+        deviceActive = false;
+        pendingActivate = true;
       }
       wasActiveBeforeSuspend = false;
       suspendStartMs = 0;
@@ -651,6 +658,7 @@ void loop() {
     // Brief bounce — restore without reinit
     suspendStartMs = 0;
     if (wasActiveBeforeSuspend) {
+      deviceActive = false;
       pendingActivate = true;  // let usbTask do proper HID init
     }
     wasActiveBeforeSuspend = false;
