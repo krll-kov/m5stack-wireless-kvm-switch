@@ -548,6 +548,15 @@ void max3421Poll() {
       strncpy(bleFoundName, "Classic HID", sizeof(bleFoundName) - 1);
     bleState = 4;
     snprintf(maxStatusMsg, sizeof(maxStatusMsg), "classic HID!");
+    // Enter sniff immediately on connection — match current idle level
+    if (lastIdleLevel >= 4)
+      Btd.hci_sniff_mode(Btd.hci_handle, 800, 640, 2, 1);   // 500ms
+    else if (lastIdleLevel >= 3)
+      Btd.hci_sniff_mode(Btd.hci_handle, 320, 256, 2, 1);   // 200ms
+    else if (lastIdleLevel >= 1)
+      Btd.hci_sniff_mode(Btd.hci_handle, 80, 64, 4, 1);     // 50ms
+    else
+      Btd.hci_sniff_mode(Btd.hci_handle, 16, 16, 4, 1);     // 10ms active
     Serial.println("BTHID connected");
     needRedraw = true;
   } else if (!connected && wasConnected) {
@@ -698,6 +707,10 @@ static uint32_t xferDeadMs = 0;
 static volatile uint32_t lastXferCbMs = 0;
 static int recoverFails = 0;
 static volatile bool usbResetRequest = false;
+static volatile bool mouseIdleSuspended = false;
+static uint32_t mouseIdlePollMs = 0;
+#define MOUSE_IDLE_POLL_INTERVAL_MS 500   // wake-check every 500ms during idle
+#define MOUSE_IDLE_POLL_WINDOW_MS  20    // poll window per check (dongle buffers data)
 
 static bool findHidEp();
 
@@ -930,7 +943,66 @@ void usbHostTask(void *) {
       }
     }
 
-    if (usbDev && !epAddr) {
+    // ── Mouse idle suspend: stop USB polling so dongle + mouse can sleep ──
+    if (il >= 3 && !mouseIdleSuspended && usbMouseReady && usbDev && epAddr) {
+      for (int i = 0; i < 2; i++) {
+        if (xfers[i]) {
+          usb_host_transfer_free(xfers[i]);
+          xfers[i] = NULL;
+        }
+      }
+      usb_host_interface_release(usbClient, usbDev, hidIfNum);
+      epAddr = 0;
+      mouseIdleSuspended = true;
+      usbMouseReady = false;
+      xferDead = false;
+      xferDeadMs = 0;
+      mouseIdlePollMs = millis();
+      needRedraw = true;
+    }
+
+    // Periodic wake-check: briefly re-enable USB to detect mouse movement
+    if (mouseIdleSuspended && usbDev && (millis() - mouseIdlePollMs >= MOUSE_IDLE_POLL_INTERVAL_MS)) {
+      mouseIdlePollMs = millis();
+      if (findHidEp()) {
+        usbMouseReady = true;
+        // Poll briefly — if mouse moved, mouseXferCb fires and updates lastActivityMs
+        for (int w = 0; w < MOUSE_IDLE_POLL_WINDOW_MS; w++) {
+          usb_host_lib_handle_events(1, NULL);
+          usb_host_client_handle_events(usbClient, 0);
+        }
+        if (idleLevel() < 3) {
+          // Mouse moved! Stay resumed.
+          mouseIdleSuspended = false;
+          recoverFails = 0;
+          needRedraw = true;
+        } else {
+          // No activity — go back to sleep
+          for (int i = 0; i < 2; i++) {
+            if (xfers[i]) {
+              usb_host_transfer_free(xfers[i]);
+              xfers[i] = NULL;
+            }
+          }
+          usb_host_interface_release(usbClient, usbDev, hidIfNum);
+          epAddr = 0;
+          usbMouseReady = false;
+        }
+      }
+    }
+
+    // Resume from idle when other activity detected (keyboard/touch)
+    if (il < 3 && mouseIdleSuspended && usbDev) {
+      vTaskDelay(pdMS_TO_TICKS(50));
+      if (findHidEp()) {
+        usbMouseReady = true;
+        recoverFails = 0;
+        needRedraw = true;
+      }
+      mouseIdleSuspended = false;
+    }
+
+    if (usbDev && !epAddr && !mouseIdleSuspended) {
       vTaskDelay(pdMS_TO_TICKS(200));
       if (findHidEp()) {
         usbMouseReady = true;
@@ -1316,9 +1388,29 @@ static bool bleDoConnect() {
   needRedraw = true;
   {
     uint32_t lastBatMs = millis();
+    int prevBleIdle = 0;
     while (c->isConnected()) {
       vTaskDelay(pdMS_TO_TICKS(500));
-      if (idleLevel() <= 2 && (millis() - lastBatMs >= 600000)) {
+      int il = idleLevel();
+
+      // ── BLE keyboard idle: relax connection params to save battery ──
+      // interval units = 1.25ms, latency = skip N connection events
+      if (il == 0 && prevBleIdle >= 1) {
+        // Active typing → fast response
+        c->updateConnParams(6, 12, 0, 600);    // 7.5-15ms, respond every event
+      } else if (il >= 1 && il < 3 && (prevBleIdle == 0 || prevBleIdle >= 3)) {
+        // 10s idle → light idle: ~50ms effective (like macOS)
+        c->updateConnParams(24, 40, 4, 600);   // 30-50ms interval, skip 4
+      } else if (il == 3 && prevBleIdle != 3) {
+        // 5min idle → medium: ~300ms effective
+        c->updateConnParams(40, 80, 6, 600);   // 50-100ms interval, skip 6
+      } else if (il == 4 && prevBleIdle != 4) {
+        // 15min idle → deep: ~800ms effective
+        c->updateConnParams(80, 160, 8, 600);  // 100-200ms interval, skip 8
+      }
+      prevBleIdle = il;
+
+      if (il <= 2 && (millis() - lastBatMs >= 600000)) {
         int bat = readBleBattery(c);
         if (bat >= 0 && bat != kbdBatteryPct) {
           kbdBatteryPct = bat;
@@ -2273,17 +2365,18 @@ void loop() {
   if (idlelvl != lastIdleLevel) {
       int prevIdle = lastIdleLevel;
       lastIdleLevel = idlelvl;
-      if (idlelvl >= 3) {
+
+      // ── WiFi power management ──
+      if (idlelvl >= 3 && prevIdle < 3) {
         wifiNeedsBackToNormal = true;
         esp_wifi_set_ps(WIFI_PS_MIN_MODEM);
         esp_wifi_set_max_tx_power(40);
-      } else if (wifiNeedsBackToNormal) {
+      } else if (idlelvl < 3 && wifiNeedsBackToNormal) {
         esp_wifi_set_ps(WIFI_PS_NONE);
         esp_wifi_set_max_tx_power(80);
         wifiNeedsBackToNormal = false;
-        // Waking from deep idle — burst-send PKT_ACTIVATE so target recovers fast
         if (prevIdle >= 3) {
-          delay(5);  // let WiFi stabilize
+          delay(5);
           for (int i = 0; i < 3; i++) {
             sendCmd(activeMac(), PKT_ACTIVATE);
             delay(2);
@@ -2291,6 +2384,29 @@ void loop() {
           lastBeat = millis();
         }
       }
+
+      // ── Classic BT sniff mode — save keyboard battery ──
+      // Intervals in 0.625ms units. attempt/timeout in 1.25ms units.
+      // Always in sniff (like macOS). Deeper sniff at higher idle levels.
+#if USE_MAX_MODULE
+      if (mxClassicConnected && bthid.connected) {
+        if (idlelvl == 0 && prevIdle >= 1) {
+          // Active typing → 10ms sniff (~8x savings, <10ms latency — imperceptible)
+          Btd.hci_sniff_mode(Btd.hci_handle, 16, 16, 4, 1);
+        } else if (idlelvl >= 1 && idlelvl < 3 && (prevIdle == 0 || prevIdle >= 3)) {
+          // 10s idle → 50ms sniff, ~20x savings
+          Btd.hci_sniff_mode(Btd.hci_handle, 80, 64, 4, 1);
+        } else if (idlelvl == 3 && prevIdle != 3) {
+          // 5min idle → 200ms sniff, ~80x savings
+          Btd.hci_sniff_mode(Btd.hci_handle, 320, 256, 2, 1);
+        } else if (idlelvl == 4 && prevIdle != 4) {
+          // 15min idle → 500ms sniff, ~200x savings
+          Btd.hci_sniff_mode(Btd.hci_handle, 800, 640, 2, 1);
+        }
+      }
+#endif
+
+      // BLE keyboard idle conn params handled in bleDoConnect() loop
   }
 
   updateBatTrend();

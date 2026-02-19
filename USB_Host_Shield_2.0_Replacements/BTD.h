@@ -403,6 +403,14 @@ public:
         void hci_connect(uint8_t *bdaddr);
         /** Used to a set the class of the device. */
         void hci_write_class_of_device();
+
+        /**
+         * Enter sniff mode to save remote device battery.
+         * Intervals are in 0.625ms units (e.g. 800 = 500ms).
+         */
+        void hci_sniff_mode(uint16_t handle, uint16_t max_interval, uint16_t min_interval, uint16_t attempt, uint16_t timeout);
+        /** Exit sniff mode and return to active mode. */
+        void hci_exit_sniff_mode(uint16_t handle);
         /**@}*/
 
         /** @name L2CAP Commands */

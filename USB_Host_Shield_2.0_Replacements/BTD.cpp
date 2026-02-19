@@ -1547,6 +1547,34 @@ void BTD::hci_write_class_of_device() { // See http://bluetooth-pentest.narod.ru
 
         HCI_Command(hcibuf, 6);
 }
+
+void BTD::hci_sniff_mode(uint16_t handle, uint16_t max_interval, uint16_t min_interval, uint16_t attempt, uint16_t timeout) {
+        hcibuf[0] = 0x03; // HCI OCF = 0x03 (Sniff Mode)
+        hcibuf[1] = 0x02 << 2; // HCI OGF = 0x02 (Link Policy)
+        hcibuf[2] = 0x0A; // parameter length = 10
+        hcibuf[3] = (uint8_t)(handle & 0xFF);
+        hcibuf[4] = (uint8_t)((handle >> 8) & 0x0F);
+        hcibuf[5] = (uint8_t)(max_interval & 0xFF);
+        hcibuf[6] = (uint8_t)(max_interval >> 8);
+        hcibuf[7] = (uint8_t)(min_interval & 0xFF);
+        hcibuf[8] = (uint8_t)(min_interval >> 8);
+        hcibuf[9] = (uint8_t)(attempt & 0xFF);
+        hcibuf[10] = (uint8_t)(attempt >> 8);
+        hcibuf[11] = (uint8_t)(timeout & 0xFF);
+        hcibuf[12] = (uint8_t)(timeout >> 8);
+
+        HCI_Command(hcibuf, 13);
+}
+
+void BTD::hci_exit_sniff_mode(uint16_t handle) {
+        hcibuf[0] = 0x04; // HCI OCF = 0x04 (Exit Sniff Mode)
+        hcibuf[1] = 0x02 << 2; // HCI OGF = 0x02 (Link Policy)
+        hcibuf[2] = 0x02; // parameter length = 2
+        hcibuf[3] = (uint8_t)(handle & 0xFF);
+        hcibuf[4] = (uint8_t)((handle >> 8) & 0x0F);
+
+        HCI_Command(hcibuf, 5);
+}
 /*******************************************************************
  *                                                                 *
  *                        HCI ACL Data Packet                      *
