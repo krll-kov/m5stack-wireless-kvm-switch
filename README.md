@@ -524,6 +524,7 @@ https://github.com/krll-kov/m5stack-wireless-kvm-switch/blob/main/ino_cores3se.i
 | **Apple fn/Globe key — dictation popup** | The fn (Globe) key is forwarded as a consumer control key (usage 0x029D). A quick tap while typing may trigger the macOS "Enable Dictation?" dialog. To fix: go to **System Settings → Keyboard → Dictation** and turn it off, or change **"Press fn key to"** to "Change Input Source". You also have to select "Start Dictation - Press twice" and in bottom section change the shortcut to microphone, then switch back to "Change Input Source" |
 | **Battery status does not update** | If you don't use debug mode, the only way to update the screen is to press mouse4 to switch pc or to plug-out/in mouse dongle, this is made for performance reasons. Also if you charge with battery base - we can't get the voltage and other info directly with code so we measure it by taking periodic battery samples. Apple keyboard battery is read from two HID reports: 0xF0 (periodic battery report) and 0x9B (device status report, byte 2 = battery %). |
 | **Screen goes black** | This is done because of power efficiency - screen is only displayed during setup/pc switch (10sec here), without it battery will drain faster than it's charing from battery bottom |
+| **Unlock to use accessories MacOS lock-screen** | One of the most recent MacOS updates has changed something and after a night of inactivity mouse and keyboard do not work on lock screen, to fix this you need to go to Settings → Privacy & Security → Accessories and switch it to "Always Allow" |
 
 ---
 
