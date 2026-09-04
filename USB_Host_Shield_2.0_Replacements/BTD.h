@@ -421,6 +421,20 @@ public:
         void hci_exit_sniff_mode(uint16_t handle);
         /** Enable sniff subrating — allows skipping sniff slots when idle. */
         void hci_sniff_subrating(uint16_t handle, uint16_t max_latency, uint16_t min_remote_timeout, uint16_t min_local_timeout);
+        /** Mark BT channels bad so AFH hops around them. map = 10 bytes / 79 bits, bit set = good. */
+        void hci_set_afh_classification(const uint8_t *map);
+        /**
+         * True when the controller has acknowledged the last HCI command.
+         * This library keeps a single flag and does not honour
+         * Num_HCI_Command_Packets, so a caller sending several commands in a
+         * row must wait on this between them - most controllers accept only
+         * one outstanding command and silently drop the rest.
+         */
+        bool hciCmdComplete(void) { return hci_check_flag(HCI_FLAG_CMD_COMPLETE) != 0; }
+        /** True once the controller has accepted an AFH classification. */
+        bool afhAccepted = false;
+        /** Non-zero = the controller rejected it; value is the HCI status byte. */
+        uint8_t afhRejected = 0;
         /**@}*/
 
         /** @name L2CAP Commands */

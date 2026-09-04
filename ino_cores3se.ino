@@ -16,6 +16,7 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <mbedtls/aes.h>
+#include <Preferences.h>
 
 #include "driver/temperature_sensor.h"
 #include "freertos/FreeRTOS.h"
@@ -27,8 +28,9 @@
 #define WITH_KEYBOARD true
 #define USE_MAX_MODULE true
 
-// Set true to show poll-rate / queue / send-rate overlay
-#define DEBUG_MODE false
+// Debug mode is a RUNTIME toggle (hold BtnC ~1s on the panel), not a build switch.
+// This is only the power-on default. While off nothing is counted, sent or drawn.
+#define DEBUG_DEFAULT_ON false
 
 struct PCTarget {
   uint8_t mac[6];
@@ -45,7 +47,12 @@ static const PCTarget targets[] = {
 static const int targetCount = sizeof(targets) / sizeof(targets[0]);
 
 #define BLE_KBD_MATCH "Keyboard"
-#define ESPNOW_CHAN 1
+// 2.4GHz channel for ESP-NOW. Must match on the CoreS3 and every AtomS3U.
+// 13 sits at the top edge of the band, so it only has neighbours on one side.
+// Channels 12-13 are outside the ESP32 default country range and will not take
+// until that range is declared - see applyEspNowChannel().
+#define ESPNOW_CHAN 13
+#define ESPNOW_COUNTRY "PL"
 #define SWITCH_DEBOUNCE_MS 300
 #define HEARTBEAT_MS 500
 #define BLE_SCAN_BUDGET_MS 20000
@@ -75,6 +82,7 @@ static const int targetCount = sizeof(targets) / sizeof(targets[0]);
 #define PKT_DEACTIVATE 0x04
 #define PKT_CONSUMER 0x06
 #define PKT_APPLE_FN 0x07
+#define PKT_DEBUG 0x08     // telemetry, broadcast once a second while debug mode is on
 
 #pragma pack(push, 1)
 typedef struct {
@@ -86,6 +94,25 @@ typedef struct {
   uint8_t modifiers;
   uint8_t keys[6];
 } kbd_evt_t;
+// One second of transmitter-side stats, broadcast to the receivers so they can
+// log it over USB. Sent only while debug mode is on.
+typedef struct {
+  uint8_t  ver;        // payload format version (2)
+  uint16_t winMs;      // length of this measurement window, ms
+  uint16_t usbHz;      // HID reports read from the mouse dongle (count over winMs)
+  uint16_t espHz;      // mouse frames handed to esp_now_send (count over winMs)
+  uint16_t msHz;       // mouse events pulled off the queue (count over winMs)
+  uint16_t usbGapMax;  // longest gap between HID reports from the dongle, ms
+  uint16_t qPeak;      // deepest the mouse queue got
+  uint16_t failMouse;  // txMouse gave up (both attempts failed)
+  uint16_t failKbd;    // txKbd gave up (all 3 attempts failed)
+  uint16_t failCmd;    // activate/deactivate/heartbeat send failed
+  uint16_t txGapMax;   // longest gap between two mouse frames leaving here, ms
+  uint16_t sendMaxUs;  // slowest single esp_now_send call, us
+  uint16_t usbDead;    // USB transfers that errored out and had to be re-armed
+  uint8_t  idle;       // idleLevel() 0..4
+  uint32_t heap;       // free heap
+} dbg_pkt_t;
 #pragma pack(pop)
 
 static QueueHandle_t mouseQueue, kbdQueue;
@@ -155,29 +182,34 @@ static int idleLevel() {
   return 0;
 }
 
-// ── Debug stats (compiled out when DEBUG_MODE=false) ──
-#if DEBUG_MODE
-
+// ── Debug stats ──
+// Everything below is gated on dbgOn. When it is false the cost is a single
+// predictable branch in the hot paths; no counters move and nothing is sent.
+static volatile bool dbgOn = DEBUG_DEFAULT_ON;
 static volatile uint32_t dbgUsbCb = 0, dbgUsbHz = 0;
 static volatile uint32_t dbgEspTx = 0, dbgEspHz = 0;
 static volatile uint32_t dbgMsTx = 0, dbgMsHz = 0;
+static volatile uint32_t dbgFailMouse = 0, dbgFailKbd = 0, dbgFailCmd = 0;
+static volatile uint32_t dbgTxGapMax = 0, dbgSendMaxUs = 0, dbgUsbDead = 0;
+static volatile uint32_t dbgUsbGapMax = 0;  // gap between HID reports from the dongle
+static volatile uint32_t dbgLastTxMs = 0;   // last time a mouse frame was sent
+static volatile uint32_t dbgLastUsbMs = 0;  // last HID report from the dongle
+// txGapMax alone cannot tell "transmitter stalled" from "mouse was not moving":
+// no movement means no sends. usbGapMax is the control - if HID reports kept
+// arriving while txGapMax spiked, the stall is ours; if both gap, the mouse
+// was simply still.
 static volatile int dbgQPeak = 0;
 static uint32_t dbgLastTick = 0;
-static void dbgTick() {
-  uint32_t now = millis();
-  if (now - dbgLastTick >= 1000) {
-    dbgUsbHz = dbgUsbCb;
-    dbgUsbCb = 0;
-    dbgEspHz = dbgEspTx;
-    dbgEspTx = 0;
-    dbgMsHz = dbgMsTx;
-    dbgMsTx = 0;
-    dbgQPeak = 0;
-    dbgLastTick = now;
-    needRedraw = true;
-  }
+static void dbgReset() {   // clear the 1s window
+  dbgUsbCb = dbgEspTx = dbgMsTx = 0;
+  dbgFailMouse = dbgFailKbd = dbgFailCmd = 0;
+  dbgTxGapMax = dbgSendMaxUs = 0;
+  dbgUsbGapMax = 0;
+  dbgUsbDead = 0;
+  dbgQPeak = 0;
 }
-#endif
+// dbgTick() is defined further down, after broadcastMac exists.
+static void dbgTick();
 
 struct seen_dev_t {
   NimBLEAddress addr;
@@ -270,12 +302,44 @@ static int getTopByRssi(int *out, int maxOut) {
   return c;
 }
 
-// ===================== ESP-NOW =====================
+// Declares the allowed channel range so channels 12-13 are reachable, then
+// sets the channel and records what actually took.
+//
+// Do NOT replace this with esp_wifi_set_country_code(). That call boot-loops
+// the AtomS3U: the panic lands in esp_psram_check_ptr_addr() with the interrupt
+// watchdog firing out of a spinlock, on a build with no PSRAM. It is harmless
+// on the CoreS3 (PSRAM=enabled), which is why the fault looked one-sided. The
+// older struct API below sets schan/nchan directly and never reaches that path.
+static uint8_t espNowChannel = ESPNOW_CHAN;
+static void applyEspNowChannel() {
+  wifi_country_t c = {};
+  c.cc[0] = ESPNOW_COUNTRY[0];
+  c.cc[1] = ESPNOW_COUNTRY[1];
+  c.cc[2] = 0;
+  c.schan = 1;
+  c.nchan = 13;
+  c.max_tx_power = 20;
+  c.policy = WIFI_COUNTRY_POLICY_MANUAL;
+  esp_wifi_set_country(&c);
+  esp_wifi_set_channel(ESPNOW_CHAN, WIFI_SECOND_CHAN_NONE);
+  // esp_wifi_set_channel() fails quietly if the range still forbids it, so keep
+  // the channel that is actually in effect rather than the one we asked for.
+  uint8_t got = 0;
+  wifi_second_chan_t sec;
+  if (esp_wifi_get_channel(&got, &sec) == ESP_OK) espNowChannel = got;
+}
+
 static void onEspNowSendDone(const uint8_t *, esp_now_send_status_t) {}
 static const uint8_t *activeMac() {
   return targets[activeTarget].mac;
 }
-static void sendCmd(const uint8_t *mac, uint8_t cmd) { esp_now_send(mac, &cmd, 1); }
+// Fire-and-forget control packet (activate / deactivate / heartbeat).
+// Behaviour is unchanged; the result is only counted so that silent TX
+// failures (queue full, radio busy) stop being invisible.
+static void sendCmd(const uint8_t *mac, uint8_t cmd) {
+  esp_err_t r = esp_now_send(mac, &cmd, 1);
+  if (dbgOn && r != ESP_OK) dbgFailCmd++;
+}
 static void switchToTarget(int newTarget) {
   if (newTarget < 0 || newTarget >= targetCount || newTarget == activeTarget) return;
   switchInProgress = true;
@@ -304,19 +368,94 @@ static void txMouse(const mouse_evt_t *m) {
                   (uint8_t)(m->y & 0xFF),
                   (uint8_t)((m->y >> 8) & 0xFF),
                   (uint8_t)m->wheel};
-  if (esp_now_send(broadcastMac, p, 7) != ESP_OK) {
+  uint32_t t0 = dbgOn ? micros() : 0;
+  bool ok = (esp_now_send(broadcastMac, p, 7) == ESP_OK);
+  if (!ok) {
     taskYIELD();  // let WiFi task drain TX queue
-    esp_now_send(broadcastMac, p, 7);  // one retry
+    ok = (esp_now_send(broadcastMac, p, 7) == ESP_OK);  // one retry
   }
-#if DEBUG_MODE
-  dbgEspTx++;
-#endif
+  if (dbgOn) {
+    dbgEspTx++;
+    if (!ok) dbgFailMouse++;          // frame never even made it into the TX queue
+    if (t0) {                         // skip if debug was switched on mid-send
+      uint32_t us = micros() - t0;
+      if (us > dbgSendMaxUs) dbgSendMaxUs = us;
+    }
+    uint32_t now = millis();          // how long the transmitter went quiet
+    if (dbgLastTxMs && (now - dbgLastTxMs) > dbgTxGapMax) dbgTxGapMax = now - dbgLastTxMs;
+    dbgLastTxMs = now;
+  }
 }
-static uint32_t kbdAesCtr;  // initialized from esp_random() in setup()
+// Snapshot the 1s window, broadcast it to the receivers, then clear it.
+// Called from loop() only while debug mode is on.
+static void dbgTick() {
+  uint32_t now = millis();
+  uint32_t win = now - dbgLastTick;
+  if (win < 1000) return;
+  dbgLastTick = now;
+
+  dbgUsbHz = dbgUsbCb;
+  dbgEspHz = dbgEspTx;
+  dbgMsHz  = dbgMsTx;
+
+  dbg_pkt_t t = {};
+  t.ver = 2;
+  t.winMs = (uint16_t)(win > 65535 ? 65535 : win);
+  t.usbGapMax = (uint16_t)dbgUsbGapMax;
+  t.usbHz = (uint16_t)dbgUsbHz;
+  t.espHz = (uint16_t)dbgEspHz;
+  t.msHz = (uint16_t)dbgMsHz;
+  t.qPeak = (uint16_t)dbgQPeak;
+  t.failMouse = (uint16_t)dbgFailMouse;
+  t.failKbd = (uint16_t)dbgFailKbd;
+  t.failCmd = (uint16_t)dbgFailCmd;
+  t.txGapMax = (uint16_t)dbgTxGapMax;
+  t.sendMaxUs = (uint16_t)(dbgSendMaxUs > 65535 ? 65535 : dbgSendMaxUs);
+  t.usbDead = (uint16_t)dbgUsbDead;
+  t.idle = (uint8_t)idleLevel();
+  t.heap = ESP.getFreeHeap();
+
+  uint8_t p[1 + sizeof(dbg_pkt_t)];
+  p[0] = PKT_DEBUG;
+  memcpy(&p[1], &t, sizeof(t));
+  esp_now_send(broadcastMac, p, sizeof(p));
+
+  dbgReset();
+  // Only ask for a redraw when the screen is actually awake: drawUI() is a full
+  // SPI repaint and it runs in loop(), the same pass that forwards keystrokes.
+  if (!screenTurnedOff) needRedraw = true;
+}
+
+// ── AES-CTR nonce ──
+// The counter must never repeat for a given key: in CTR mode a repeat means the
+// same keystream twice, and XORing those two ciphertexts leaks the plaintexts.
+// Seeding it from esp_random() each boot does not guarantee that - with ~1e5
+// keystrokes per session the ranges collide with non-trivial probability after
+// a few hundred reboots. So it is kept monotonic in NVS instead.
+//
+// Writes are batched: each boot reserves a block up front and only touches NVS
+// again when the block runs out, so this costs one flash write per reservation
+// rather than one per keystroke.
+//
+// The nonce is 4 bytes on the wire, so the space is finite either way: this
+// guarantees no reuse for ~43000 boots, after which the counter wraps and the
+// keys should be rotated.
+#define AES_CTR_RESERVE 100000UL
+static Preferences kbdPrefs;
+static uint32_t kbdAesCtr = 0;
+static uint32_t kbdAesCtrLimit = 0;
+
+static void kbdAesCtrReserve() {
+  uint32_t base = kbdPrefs.getULong("ctr", 0);
+  kbdAesCtr = base;
+  kbdAesCtrLimit = base + AES_CTR_RESERVE;   // wraps with base; still monotonic
+  kbdPrefs.putULong("ctr", kbdAesCtrLimit);
+}
 
 // AES-128-CTR encrypt: writes counter(4) + encrypted payload into `out`.
 // Returns total bytes written (4 + plainLen).
 static int aesCtrEncrypt(const uint8_t *key, const uint8_t *plain, int plainLen, uint8_t *out) {
+  if (kbdAesCtr == kbdAesCtrLimit) kbdAesCtrReserve();  // block exhausted
   uint32_t ctr = kbdAesCtr++;
   out[0] = ctr & 0xFF;
   out[1] = (ctr >> 8) & 0xFF;
@@ -346,10 +485,12 @@ static void txKbd(const kbd_evt_t *k) {
   aesCtrEncrypt(targets[activeTarget].aesKey, plain, 7, &p[1]);
 
   const uint8_t *dst = activeMac();
+  bool ok = false;
   for (int attempt = 0; attempt < 3; attempt++) {
-    if (esp_now_send(dst, p, 12) == ESP_OK) break;
+    if (esp_now_send(dst, p, 12) == ESP_OK) { ok = true; break; }
     taskYIELD();
   }
+  if (dbgOn && !ok) dbgFailKbd++;
 }
 
 static void txConsumer(uint16_t usage) {
@@ -560,8 +701,46 @@ void max3421Poll() {
     // its own power saving (like macOS). The keyboard enters sniff mode
     // automatically (~15ms interval). SSR enables deeper sleep by skipping
     // sniff slots when idle — silently ignored if dongle doesn't support it.
+    // These go out one at a time: the library does not honour
+    // Num_HCI_Command_Packets, and most controllers accept only one
+    // outstanding command, so firing them back to back loses the later ones.
+    // Bounded wait, and only on connect, so loop() is never held for long.
+    auto hciSettle = [](uint16_t timeoutMs) {
+      uint32_t t0 = millis();
+      while (!Btd.hciCmdComplete() && millis() - t0 < timeoutMs) Usb.Task();
+    };
+
     Btd.hci_write_link_policy(Btd.hci_handle, 0x05); // bit0=role switch, bit2=sniff
+    hciSettle(50);
     Btd.hci_sniff_subrating(Btd.hci_handle, 0x0000, 0x0000, 0x0000); // no constraints
+    hciSettle(50);
+
+    // Steer the keyboard's frequency hopping away from the ESP-NOW channel.
+    // The dongle sits centimetres from the ESP32 antenna and hops across the
+    // whole 2.4GHz band 1600x/sec, so it lands on our channel no matter which
+    // one we pick. Measured cost of leaving it alone: gaps >=20ms went from
+    // 0.24/s to 2.49/s, and >=100ms from 0.14/s to 0.49/s.
+    //
+    // Channel map is 79 bits, one per BT channel (2402 + n MHz), bit set = good.
+    // Built from ESPNOW_CHAN so it follows the channel automatically. AFH is
+    // advisory - the controller may ignore it - and at least 20 channels must
+    // stay good, so the span is clamped.
+    {
+      uint8_t afh[10];
+      for (int i = 0; i < 10; i++) afh[i] = 0xFF;
+      const int centre = 2407 + 5 * ESPNOW_CHAN;   // MHz
+      int marked = 0;
+      for (int n = 0; n < 79 && marked < 59; n++) {   // never mark more than 59
+        int f = 2402 + n;
+        if (f >= centre - 11 && f <= centre + 11) {
+          afh[n / 8] &= ~(1 << (n % 8));
+          marked++;
+        }
+      }
+      afh[9] &= 0x7F;   // bit 79 is reserved and must be zero
+      Btd.hci_set_afh_classification(afh);
+      hciSettle(50);
+    }
     Serial.println("BTHID connected");
     needRedraw = true;
   } else if (!connected && wasConnected) {
@@ -707,8 +886,15 @@ static usb_host_client_handle_t usbClient = NULL;
 static usb_device_handle_t usbDev = NULL;
 static usb_transfer_t *xfers[2] = {NULL, NULL};
 static uint8_t epAddr = 0, hidIfNum = 0;
-static volatile bool devGone = false, xferDead = false;
-static uint32_t xferDeadMs = 0;
+static volatile bool devGone = false;
+static volatile bool xferDeadFlag[2] = {false, false};  // per-transfer, not global
+static uint32_t xferDeadMs = 0;   // when the current dead episode started
+static uint32_t xferRetryMs = 0;  // non-blocking retry throttle
+static bool xferCleared = false;  // endpoint already un-halted this episode
+static inline bool xferAnyDead() { return xferDeadFlag[0] || xferDeadFlag[1]; }
+// Recorded for diagnostics only. It cannot drive a "no callbacks for N ms"
+// watchdog: an idle mouse legitimately produces no transfers at all, so any
+// such timeout would fire constantly while the mouse simply is not moving.
 static volatile uint32_t lastXferCbMs = 0;
 static int recoverFails = 0;
 static volatile bool usbResetRequest = false;
@@ -716,15 +902,14 @@ static bool findHidEp();
 
 static void mouseXferCb(usb_transfer_t *xfer) {
   lastXferCbMs = millis();
-#if DEBUG_MODE
-  dbgUsbCb++;
-#endif
+  if (dbgOn) dbgUsbCb++;
+  const int xi = (xfer == xfers[1]) ? 1 : 0;   // which of the two transfers this is
 
   if (switchInProgress) {
     if (usbDev && xfer) {
-      if (usb_host_transfer_submit(xfer) != ESP_OK) xferDead = true;
+      if (usb_host_transfer_submit(xfer) != ESP_OK) xferDeadFlag[xi] = true;
     } else {
-      xferDead = true;
+      xferDeadFlag[xi] = true;
     }
     return;
   }
@@ -732,6 +917,11 @@ static void mouseXferCb(usb_transfer_t *xfer) {
   if (xfer->status == USB_TRANSFER_STATUS_COMPLETED &&
       xfer->actual_num_bytes > 0) {
     lastActivityMs = millis();
+    if (dbgOn) {
+      uint32_t nu = millis();
+      if (dbgLastUsbMs && (nu - dbgLastUsbMs) > dbgUsbGapMax) dbgUsbGapMax = nu - dbgLastUsbMs;
+      dbgLastUsbMs = nu;
+    }
     uint8_t *d = xfer->data_buffer;
     int len = xfer->actual_num_bytes;
     mouse_evt_t evt = {};
@@ -760,14 +950,15 @@ static void mouseXferCb(usb_transfer_t *xfer) {
   }
 
   if (xfer->status != USB_TRANSFER_STATUS_COMPLETED) {
-    xferDead = true;
+    xferDeadFlag[xi] = true;
+    if (dbgOn) dbgUsbDead++;
     return;
   }
 
   if (usbDev && xfer) {
-    if (usb_host_transfer_submit(xfer) != ESP_OK) xferDead = true;
+    if (usb_host_transfer_submit(xfer) != ESP_OK) xferDeadFlag[xi] = true;
   } else
-    xferDead = true;
+    xferDeadFlag[xi] = true;
 }
 
 static void usbEventCb(const usb_host_client_event_msg_t *msg, void *) {
@@ -793,8 +984,9 @@ static void cleanupUsb() {
     usbDev = NULL;
   }
   epAddr = 0;
-  xferDead = false;
+  xferDeadFlag[0] = xferDeadFlag[1] = false;
   xferDeadMs = 0;
+  xferCleared = false;
   lastXferCbMs = 0;
   usb_host_lib_handle_events(10, NULL);
 }
@@ -812,8 +1004,9 @@ static bool softRecoverUsb() {
     epAddr = 0;
   }
   usbMouseReady = false;
-  xferDead = false;
+  xferDeadFlag[0] = xferDeadFlag[1] = false;
   xferDeadMs = 0;
+  xferCleared = false;
   lastXferCbMs = 0;
   if (devGone) return false;
   vTaskDelay(pdMS_TO_TICKS(200));
@@ -873,8 +1066,9 @@ static bool findHidEp() {
         }
 
         epAddr = a;
-        xferDead = false;
+        xferDeadFlag[0] = xferDeadFlag[1] = false;
         xferDeadMs = 0;
+        xferCleared = false;
         lastXferCbMs = millis();
         return true;
       }
@@ -903,7 +1097,7 @@ void usbHostTask(void *) {
 
     if (usbResetRequest) {
       usbResetRequest = false;
-      if (!usbMouseReady || xferDead) {
+      if (!usbMouseReady || xferAnyDead()) {
         cleanupUsb();
         needRedraw = true;
       }
@@ -920,27 +1114,43 @@ void usbHostTask(void *) {
       needRedraw = true;
     }
 
-    if (xferDead && usbDev) {
-      if (!xferDeadMs) xferDeadMs = millis();
-      uint32_t deadElapsed = millis() - xferDeadMs;
-      if (deadElapsed > 6000) {
+    // Re-arm transfers that errored out.
+    // Previously this slept 50ms inline, which stalled the whole mouse stream:
+    // this task is the only pump for USB client events, so sleeping also stops
+    // the *healthy* transfer from being re-submitted by its callback. It also
+    // re-submitted both transfers, but the healthy one is still in flight and
+    // always fails. Now: no sleeping, timestamp-throttled retries, and only
+    // the transfer that actually died gets re-armed.
+    if (xferAnyDead() && usbDev) {
+      if (!xferDeadMs) {
+        xferDeadMs = millis();
+        xferCleared = false;
+      }
+      if (millis() - xferDeadMs > 6000) {
         if (!softRecoverUsb()) {
           cleanupUsb();
           needRedraw = true;
         }
-      } else {
-        vTaskDelay(pdMS_TO_TICKS(50));
-        bool anyOk = false;
+      } else if (millis() - xferRetryMs >= 20) {
+        xferRetryMs = millis();
+        // A halted pipe (STALL/babble) refuses new transfers until cleared.
+        // Only do this when both are dead: clearing flushes the endpoint and
+        // would kill a transfer that is still in flight.
+        if (!xferCleared && epAddr && xferDeadFlag[0] && xferDeadFlag[1]) {
+          usb_host_endpoint_clear(usbDev, epAddr);
+          xferCleared = true;
+        }
         for (int i = 0; i < 2; i++) {
-          if (xfers[i] && usb_host_transfer_submit(xfers[i]) == ESP_OK)
-            anyOk = true;
+          if (!xferDeadFlag[i] || !xfers[i]) continue;
+          if (usb_host_transfer_submit(xfers[i]) == ESP_OK) {
+            xferDeadFlag[i] = false;
+            lastXferCbMs = millis();
+          }
         }
-        if (anyOk) {
-          xferDead = false;
-          xferDeadMs = 0;
-          lastXferCbMs = millis();
-        }
+        if (!xferAnyDead()) xferDeadMs = 0;
       }
+    } else if (!xferAnyDead()) {
+      xferDeadMs = 0;
     }
 
     if (usbDev && !epAddr) {
@@ -992,9 +1202,7 @@ void mouseSendTask(void *) {
     prevBindState = m.buttons;
 
     txMouse(&m);
-#if DEBUG_MODE
-    dbgMsTx++;
-#endif
+    if (dbgOn) dbgMsTx++;
   }
 }
 
@@ -2020,14 +2228,22 @@ static void drawUI() {
   d.drawFastHLine(8, 216, 304, COL_SEP);
 
   d.setTextSize(1);
-#if DEBUG_MODE
-  float cpuTemp = 0;
-  if (temp_handle) temperature_sensor_get_celsius(temp_handle, &cpuTemp);
-  d.setCursor(8, 218);
-  d.setTextColor(cpuTemp > 60 ? RED : CYAN);
-  d.printf("T:%.0fC U:%d E:%d Q:%d", cpuTemp, (int)dbgUsbHz, (int)dbgEspHz, dbgQPeak);
-
+  if (dbgOn) {
+    float cpuTemp = 0;
+    if (temp_handle) temperature_sensor_get_celsius(temp_handle, &cpuTemp);
+    d.setCursor(8, 218);
+    d.setTextColor(cpuTemp > 60 ? RED : CYAN);
+    // rates, queue peak, and the three silent-failure counters
+    // AFH: + accepted, - rejected (status shown), . no answer yet
+    char afh = '.';
+#if USE_MAX_MODULE
+    if (Btd.afhAccepted) afh = '+';
+    else if (Btd.afhRejected) afh = '-';
 #endif
+    d.printf("T:%.0fC C:%d%c U:%d E:%d Q:%d F:%d/%d/%d G:%d", cpuTemp,
+             (int)espNowChannel, afh, (int)dbgUsbHz, (int)dbgEspHz, dbgQPeak,
+             (int)dbgFailMouse, (int)dbgFailKbd, (int)dbgFailCmd, (int)dbgTxGapMax);
+  }
 
   d.setCursor(8, 228);
   if (extPowerDetected && batCnt >= 4) {
@@ -2127,24 +2343,25 @@ void setup() {
   mouseQueue = xQueueCreate(128, sizeof(mouse_evt_t));
   kbdQueue = xQueueCreate(32, sizeof(kbd_evt_t));
 
-#if DEBUG_MODE
+  // Installed unconditionally: debug mode is a runtime toggle now. The sensor
+  // is passive and costs nothing until it is read.
   temperature_sensor_config_t temp_sensor_config =
       TEMPERATURE_SENSOR_CONFIG_DEFAULT(10, 80);
   temperature_sensor_install(&temp_sensor_config, &temp_handle);
   temperature_sensor_enable(temp_handle);
-#endif
 
   WiFi.mode(WIFI_STA);
   WiFi.disconnect();
-  esp_wifi_set_channel(ESPNOW_CHAN, WIFI_SECOND_CHAN_NONE);
+  applyEspNowChannel();
   esp_wifi_set_ps(WIFI_PS_NONE);
   esp_now_init();
   esp_now_register_send_cb(onEspNowSendDone);
-  kbdAesCtr = esp_random();
+  kbdPrefs.begin("kvm", false);
+  kbdAesCtrReserve();
   for (int i = 0; i < targetCount; i++) {
     esp_now_peer_info_t p = {};
     memcpy(p.peer_addr, targets[i].mac, 6);
-    p.channel = ESPNOW_CHAN;
+    p.channel = espNowChannel;
     p.encrypt = false;
     p.ifidx = WIFI_IF_STA;
     esp_now_add_peer(&p);
@@ -2153,7 +2370,7 @@ void setup() {
   {
     esp_now_peer_info_t bp = {};
     memset(bp.peer_addr, 0xFF, 6);
-    bp.channel = ESPNOW_CHAN;
+    bp.channel = espNowChannel;
     bp.encrypt = false;
     bp.ifidx = WIFI_IF_STA;
     esp_now_add_peer(&bp);
@@ -2202,9 +2419,7 @@ void setup() {
 
   delay(300);
   lastActivityMs = millis();
-#if DEBUG_MODE
   dbgLastTick = millis();
-#endif
 
   batCheckLast = millis() - BAT_SAMPLE_MS;
   drawUI();
@@ -2218,11 +2433,25 @@ static int prevBleS = -1;
 void loop() {
   M5.update();
   max3421Poll();
-#if DEBUG_MODE
-  dbgTick();
-  int qn = uxQueueMessagesWaiting(mouseQueue);
-  if (qn > dbgQPeak) dbgQPeak = qn;
-#endif
+
+  // Hold BtnC ~1s to toggle debug mode: stats collection, the on-screen
+  // overlay, and the once-a-second telemetry broadcast all follow this flag.
+  if (M5.BtnC.wasHold()) {
+    dbgOn = !dbgOn;
+    dbgReset();
+    dbgLastTick = millis();
+    dbgLastTxMs = 0;   // both gap references, or the first sample after a
+    dbgLastUsbMs = 0;  // re-enable reports the whole time debug was off
+    lastActivityMs = millis();
+    lastScreenTouchMs = lastActivityMs;   // keep the screen up so it can be read
+    needRedraw = true;
+  }
+
+  if (dbgOn) {
+    dbgTick();
+    int qn = uxQueueMessagesWaiting(mouseQueue);
+    if (qn > dbgQPeak) dbgQPeak = qn;
+  }
 
   if ((M5.BtnA.wasPressed() || switchRequestTarget >= 0) &&
       millis() - lastSwitchMs > SWITCH_DEBOUNCE_MS) {
@@ -2358,6 +2587,9 @@ void loop() {
     prevPk = cP;
     needRedraw = false;
     drawUI();
+    // A full repaint takes tens of ms; forward anything the keyboard produced
+    // during it right away instead of holding it until the next loop pass.
+    { kbd_evt_t kd; while (xQueueReceive(kbdQueue, &kd, 0) == pdTRUE) txKbd(&kd); }
   }
 
   delay(loopDelay);

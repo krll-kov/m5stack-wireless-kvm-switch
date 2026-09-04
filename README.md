@@ -370,6 +370,20 @@ After installing the library, modify these files in your Arduino libraries folde
 
 12. **`BTD.cpp`** — added `EV_MODE_CHANGE` (0x14) and `EV_SNIFF_SUBRATING` (0x2E) event handlers. Logs mode transitions, sniff intervals, and SSR negotiation results under `DEBUG_USB_HOST`. Event mask updated (`0x1F` → `0x3F`) to enable bit 45 for `EV_SNIFF_SUBRATING`. Also added logging for failed HCI commands in `EV_COMMAND_COMPLETE` handler.
 
+13. **`BTD.h`** and **`BTD.cpp`** — added `hci_set_afh_classification()` (OGF `0x03` / OCF `0x3F`, *Set_AFH_Host_Channel_Classification*). Tells the controller which of the 79 Bluetooth channels the host considers bad so adaptive frequency hopping steers around them; the firmware builds the map from `ESPNOW_CHAN` and marks the ±11MHz around the ESP-NOW channel.
+
+    Why it matters: the BT dongle sits centimetres from the ESP32 antenna and hops across the whole 2.4GHz band 1600×/sec, so it lands on the ESP-NOW channel no matter which one you pick. Measured on a CoreS3 with an Apple Magic Keyboard connected:
+
+    | | gaps ≥20ms | gaps ≥100ms | median worst gap |
+    |---|---|---|---|
+    | keyboard on, no AFH | 2.49/s | 0.49/s | 41ms |
+    | keyboard on, **AFH** | 2.02/s | 0.31/s | **17ms** |
+    | keyboard off (floor) | 0.24/s | 0.14/s | 12ms |
+
+    AFH is **advisory** — the controller may ignore it, and at least 20 of the 79 channels must stay marked good or the command is rejected. The DFRobot TEL0002 accepts it (unlike SSR). Two status fields report the outcome: `afhAccepted` and `afhRejected` (the HCI status byte). The firmware shows this next to the channel in the debug overlay as `C:13+` (accepted), `-` (rejected) or `.` (no answer yet).
+
+14. **`BTD.h`** — added `hciCmdComplete()`, a public accessor for the `HCI_FLAG_CMD_COMPLETE` flag. The library keeps a single completion flag and does **not** honour `Num_HCI_Command_Packets`, so sending several HCI commands back to back silently loses all but the first on controllers that accept only one outstanding command. The firmware now waits on this between `hci_write_link_policy()`, `hci_sniff_subrating()` and `hci_set_afh_classification()` (bounded wait, on connect only).
+
 ---
 
 ## 🔍 Step 1 — Get MAC Addresses of Both Atom S3U
@@ -457,7 +471,9 @@ Before uploading, **update these values** in the sketch:
 | `USE_MAX_MODULE` | Set `true` if using the classic USB module | `false` |
 | `WITH_KEYBOARD` | Set `false` for mouse-only mode | `true` |
 | `BLE_PROBE_MIN_RSSI` | Raise to `-80` if keyboard is far away | `-55` |
-| `DEBUG_MODE` | Set to true to see debug mode stats (USB poll rate, ESP-NOW send rate, queue depth) | `false` |
+| `ESPNOW_CHAN` | 2.4GHz channel for ESP-NOW. **Must match on the CoreS3 and every AtomS3U.** Pick one clear of nearby Wi-Fi | `13` |
+| `ESPNOW_COUNTRY` | Country code declaring the legal channel range. Only matters for channels 12-13 — see the comment on `applyEspNowChannel()` | `"PL"` |
+| `DEBUG_DEFAULT_ON` | Power-on state of debug mode. It is a **runtime** toggle now — see [Debug Mode](#-debug-mode) | `false` |
 
 #### PC Targets Configuration
 
@@ -491,7 +507,7 @@ Each PC has its own switch bind (mouse button):
 | Mouse 5 (forward) | bit 4 | `0x10` |
 | Mouse 6 | bit 5 | `0x20` |
 
-> **Security:** Keyboard data is encrypted with AES-128-CTR (hardware-accelerated) over the air. Each PC has its own AES key — the key for each target must match the corresponding AtomS3U receiver. Mouse data is sent as unencrypted broadcast for maximum performance. **Generate your own random 16-byte keys and set them in both `ino_cores3se.ino` (`targets[].aesKey`) and `ino_atoms3u.ino` (`AES_KEY`) — the values must match per PC.** Using the same key for all PCs is fine but means a compromised key on one PC exposes all keyboard traffic.
+> **Security:** Keyboard data is encrypted with AES-128-CTR (hardware-accelerated) over the air. Each PC has its own AES key — the key for each target must match the corresponding AtomS3U receiver. Mouse data is sent as unencrypted broadcast for maximum performance. **Generate your own random 16-byte keys and set them in both `ino_cores3se.ino` (`targets[].aesKey`) and `ino_atoms3u.ino` (`AES_KEY`) — the values must match per PC.** The CTR nonce is kept monotonic in NVS (reserved in blocks of 100000, one flash write per block) so it never repeats across reboots — a repeated counter would reuse the keystream and leak plaintext. The nonce is 4 bytes on the wire, so rotate the keys after roughly 43000 boots. Using the same key for all PCs is fine but means a compromised key on one PC exposes all keyboard traffic.
 
 <details>
 <summary>📄 <b>CoreS3 SE Main Controller Sketch</b> — click to expand</summary>
@@ -501,6 +517,62 @@ https://github.com/krll-kov/m5stack-wireless-kvm-switch/blob/main/ino_cores3se.i
 ```
 
 </details>
+
+---
+
+## 🔬 Debug Mode
+
+Debug mode is a **runtime toggle**, not a build flag — no reflashing to turn it on.
+
+**Hold `BtnC` (right touch button) on the CoreS3 for ~1 second** to switch it on or off. Short presses still just wake the screen. The state is not kept across reboots, so a reset always comes back with debug off.
+
+While it is **off**, nothing is measured, sent or drawn: every collection point sits behind a single boolean check, so normal operation is unaffected.
+
+While it is **on**:
+
+1. **On-screen overlay** appears in the CoreS3 bottom bar:
+
+   ```
+   T:47C U:1000 E:1000 Q:2 F:0/0/0 G:3
+   ```
+
+   | Field | Meaning |
+   |---|---|
+   | `T` | CPU temperature, °C |
+   | `U` | HID reports read from the mouse dongle, per second |
+   | `E` | mouse frames handed to `esp_now_send`, per second |
+   | `Q` | deepest the mouse queue got |
+   | `F` | send failures: mouse / keyboard / control packets |
+   | `G` | longest gap between two mouse frames leaving the box, ms |
+
+2. **Telemetry is broadcast** once a second as a `PKT_DEBUG` frame. Each AtomS3U receiver picks it up, switches its own debug on automatically, and prints both sides to its USB CDC serial port:
+
+   ```
+   TX win=1001ms usb=1000 esp=1000 ms=1000 q=2 fail=0/0/0 txgap=3ms usbgap=3ms send=180us dead=0 idle=0 heap=180244
+   RX win=1002ms esp=1002 mouse=1000 hb=2 gapmax=6ms rssi=-39/-33 usb=1000 mrg=0 w=12/50 q=3,0 act=1
+      gaps <20=998 20-49=2 50-99=0 100-199=0 200-499=0 500+=0
+   ```
+
+   The `gaps` histogram buckets the time between received packets. A worst-case number alone cannot tell a single rare spike from a steady pattern, and the pattern is what points at the source of interference.
+
+   Both lines are **raw counts over the window they name** (`win=`), so they can be compared directly — `TX esp` against `RX mouse` gives the actual loss.
+
+   `TX` is the transmitter's own view, `RX` is what the receiver got. The three fields that matter:
+
+   | Comparison | Meaning |
+   |---|---|
+   | `fail` non-zero | `esp_now_send` refused the frame — TX queue full or radio busy |
+   | `TX esp` high, `RX mouse` low | frames were sent and lost **in the air** |
+   | `txgap` spikes but `usbgap` stays small | the transmitter stalled while the mouse kept reporting |
+   | `txgap` and `usbgap` spike together | the mouse simply was not moving — not a fault |
+
+   `usbgap` exists precisely to keep `txgap` honest: no mouse movement means no sends, which would otherwise read as a stall.
+
+   The receiver turns its debug off again ~5 seconds after telemetry stops arriving.
+
+To read it, open the AtomS3U's serial port at any baud rate (it is USB CDC, the rate is ignored) — e.g. the Arduino IDE **Serial Monitor**, or `screen /dev/cu.usbmodemXXXX`.
+
+> The receiver decodes telemetry format `ver=1`. If the transmitter ever sends a newer format, the receiver prints it as a hex dump instead of guessing — so the AtomS3U never needs reflashing just to follow a change on the CoreS3 side.
 
 ---
 
@@ -522,6 +594,7 @@ https://github.com/krll-kov/m5stack-wireless-kvm-switch/blob/main/ino_cores3se.i
 | **First input delay after idle** | The device enters power-saving mode after inactivity (10 sec = 1ms delay, 1 minute = 20ms delay, 5 min = 50ms delay, 15 min = 100ms delay). The first mouse movement after wake may feel slightly delayed. Mouse USB polling remains active at all idle levels (USB SOF keeps the dongle awake, and submitted transfers cost nothing when idle — NAK is handled in hardware). Classic BT keyboards negotiate sniff mode automatically with the dongle (enabled by setting link policy to allow sniff + role switch after connection) — the Apple Magic Keyboard enters sniff at ~15ms interval. Sniff Subrating (SSR) for deeper idle sleep is supported in code but the DFRobot TEL0002 dongle does not support it; a dongle with SSR support would allow the keyboard to skip sniff slots during extended idle. BLE keyboards use relaxed connection parameters at higher idle levels. All power-saving is transparent and reverts to full speed on activity. |
 | **Mouse rate** | Mouse events are forwarded 1:1 at the native poll rate of your mouse (tested up to 1000Hz). ESP-NOW uses 6.5 Mbps HT20 PHY for sufficient wireless throughput, and the AtomS3U uses non-blocking USB sends to avoid frame-alignment bottlenecks. On Linux, the CDC serial port must be kept open for full speed — see [Linux setup](#-linux-host-setup-required). |
 | **Apple fn/Globe key — dictation popup** | The fn (Globe) key is forwarded as a consumer control key (usage 0x029D). A quick tap while typing may trigger the macOS "Enable Dictation?" dialog. To fix: go to **System Settings → Keyboard → Dictation** and turn it off, or change **"Press fn key to"** to "Change Input Source". You also have to select "Start Dictation - Press twice" and in bottom section change the shortcut to microphone, then switch back to "Change Input Source" |
+| **`loop()` starvation on the receiver** | Fixed. `usbTask` runs at priority 10 on the same core as `loop()` (priority 1, `LoopCore=1`), and `taskYIELD()` only hands off to equal-or-higher priority tasks — so while the mouse was moving `loop()` never ran, stopping all USB mount/suspend/replug handling. It now gets a real scheduling slot ~20×/sec. |
 | **Battery status does not update** | If you don't use debug mode, the only way to update the screen is to press mouse4 to switch pc or to plug-out/in mouse dongle, this is made for performance reasons. Also if you charge with battery base - we can't get the voltage and other info directly with code so we measure it by taking periodic battery samples. Apple keyboard battery is read from two HID reports: 0xF0 (periodic battery report) and 0x9B (device status report, byte 2 = battery %). |
 | **Screen goes black** | This is done because of power efficiency - screen is only displayed during setup/pc switch (10sec here), without it battery will drain faster than it's charing from battery bottom |
 | **Unlock to use accessories MacOS lock-screen** | One of the most recent MacOS updates has changed something and after a night of inactivity mouse and keyboard do not work on lock screen, to fix this you need to go to Settings → Privacy & Security → Accessories and switch it to "Always Allow" |

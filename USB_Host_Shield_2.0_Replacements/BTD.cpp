@@ -473,12 +473,19 @@ void BTD::HCI_event_task() {
                                                 for(uint8_t i = 0; i < 6; i++)
                                                         my_bdaddr[i] = hcibuf[6 + i];
                                                 hci_set_flag(HCI_FLAG_READ_BDADDR);
+                                        } else if((hcibuf[3] == 0x3F) && (hcibuf[4] == 0x0C)) { // AFH classification accepted
+                                                afhAccepted = true;
+#ifdef DEBUG_USB_HOST
+                                                Notify(PSTR("\r\nAFH channel classification set"), 0x80);
+#endif
                                         } else if((hcibuf[3] == 0x11) && (hcibuf[4] == 0x08)) { // Sniff Subrating accepted
 #ifdef DEBUG_USB_HOST
                                                 Notify(PSTR("\r\nSniff Subrating enabled"), 0x80);
 #endif
                                         }
                                 } else {
+                                        if((hcibuf[3] == 0x3F) && (hcibuf[4] == 0x0C))
+                                                afhRejected = hcibuf[5]; // keep the status byte
 #ifdef DEBUG_USB_HOST
                                         Notify(PSTR("\r\nHCI Cmd Failed: op="), 0x80);
                                         D_PrintHex<uint8_t>(hcibuf[4], 0x80);
@@ -1623,6 +1630,22 @@ void BTD::hci_exit_sniff_mode(uint16_t handle) {
         hcibuf[4] = (uint8_t)((handle >> 8) & 0x0F);
 
         HCI_Command(hcibuf, 5);
+}
+
+// Set_AFH_Host_Channel_Classification: tells the controller which of the 79
+// BT channels the host believes are bad, so adaptive frequency hopping steers
+// around them. Used here to keep the dongle off the ESP-NOW channel.
+// map[] is 10 bytes = 79 bits, one per BT channel (2402 + n MHz), bit set = good.
+// The controller may keep using a "bad" channel anyway - AFH is advisory, and
+// at least 20 channels must stay marked good or the command is rejected.
+void BTD::hci_set_afh_classification(const uint8_t *map) {
+        hcibuf[0] = 0x3F; // HCI OCF = 0x3F (Set_AFH_Host_Channel_Classification)
+        hcibuf[1] = 0x03 << 2; // HCI OGF = 0x03 (Controller & Baseband)
+        hcibuf[2] = 0x0A; // parameter length = 10
+        for(uint8_t i = 0; i < 10; i++)
+                hcibuf[3 + i] = map[i];
+
+        HCI_Command(hcibuf, 13);
 }
 
 void BTD::hci_sniff_subrating(uint16_t handle, uint16_t max_latency, uint16_t min_remote_timeout, uint16_t min_local_timeout) {
