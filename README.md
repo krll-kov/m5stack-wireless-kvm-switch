@@ -4,6 +4,10 @@
 
 Switch between multiple PCs (2+) with a single mouse button press. No cables for peripherals, no lag.
 
+<p align="center">
+  <img src="showcase.webp" alt="CoreS3 SE showing PC 1 selected, mouse and keyboard connected" width="640">
+</p>
+
 ---
 
 ## 📦 Hardware
