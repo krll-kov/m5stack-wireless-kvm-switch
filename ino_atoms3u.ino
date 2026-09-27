@@ -8,6 +8,7 @@
 #include "USBHIDConsumerControl.h"
 #include "USBCDC.h"
 #include "freertos/queue.h"
+#include "soc/usb_dwc_struct.h"
 
 // Debug is no longer a build switch. The receiver mirrors the transmitter:
 // it turns itself on when CoreS3 telemetry (PKT_DEBUG) starts arriving and
@@ -44,6 +45,7 @@ uint8_t tud_hid_n_get_protocol(uint8_t instance);
 #define BOOT_GRACE_MS       5000
 #define ESPNOW_TIMEOUT_MS   3400
 #define USB_GONE_REPLUG_MS  3000
+#define REPLUG_OFF_MS       100
 #define SLEEP_SETTLE_MS     7500
 
 #define USB_IDLE_TIMEOUT_MS_4 900000
@@ -196,6 +198,14 @@ volatile uint32_t lastPacketMs = 0;
 static uint32_t usbGoneSinceMs = 0;
 static uint32_t suspendStartMs = 0;
 static uint32_t lastInputMs = 0;
+static uint32_t busLostMs = 0;
+static uint16_t sofLastFn = 0;
+static bool sofQuiet = false;
+static uint32_t sofResumeMs = 0;
+static uint32_t sofResumeAt = 0;
+volatile uint32_t lastRxMs = 0;
+volatile uint32_t lastUserRxMs = 0;
+volatile bool selected = false;
 
 // ── Debug stats ──
 // All of it is gated on dbgOn; while it is false nothing is counted or printed,
@@ -276,6 +286,7 @@ static void aesCtrDecrypt(const uint8_t *key, const uint8_t *in, uint8_t *out, i
 void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
   if (len < 1) return;
   lastPacketMs = millis();
+  lastRxMs = lastPacketMs;
 
   // Telemetry frame: turns debug on here and is handed to loop() for printing.
   if (data[0] == PKT_DEBUG) {
@@ -307,12 +318,15 @@ void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
 
   switch (data[0]) {
     case PKT_ACTIVATE:
+      selected = true;
       pendingActivate = true;
       break;
     case PKT_DEACTIVATE:
+      selected = false;
       pendingDeactivate = true;
       break;
     case PKT_MOUSE:
+      if (selected) lastUserRxMs = millis();
       if (len >= 7 && deviceActive) {
         MousePkt p;
         p.btn = data[1];
@@ -323,6 +337,7 @@ void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
       }
       break;
     case PKT_KEYBOARD:
+      lastUserRxMs = millis();
       if (len >= 12) {
         uint8_t dec[7];
         aesCtrDecrypt(AES_KEY, &data[1], dec, 7);
@@ -333,6 +348,7 @@ void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
       }
       break;
     case PKT_CONSUMER:
+      lastUserRxMs = millis();
       if (len >= 7 && deviceActive) {
         uint8_t dec[2];
         aesCtrDecrypt(AES_KEY, &data[1], dec, 2);
@@ -341,6 +357,7 @@ void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
       }
       break;
     case PKT_APPLE_FN:
+      lastUserRxMs = millis();
       if (len >= 6 && deviceActive) {
         uint8_t dec[1];
         aesCtrDecrypt(AES_KEY, &data[1], dec, 1);
@@ -350,6 +367,14 @@ void onRecv(const esp_now_recv_info_t *info, const uint8_t *data, int len) {
     case PKT_HEARTBEAT:
       break;
   }
+}
+
+static inline bool userInputSince(uint32_t ms) {
+  return (int32_t)(lastUserRxMs - ms) > 0;
+}
+
+static inline bool replugWanted(uint32_t ms) {
+  return userInputSince(ms) || (int32_t)(sofResumeMs - ms) > 0;
 }
 
 static inline bool ensureUsbAwake() {
@@ -630,6 +655,7 @@ void setup() {
   }
 
   lastPacketMs = millis();
+  lastRxMs = lastPacketMs;
   dbgLastStatMs = millis();
   xTaskCreatePinnedToCore(usbTask, "USB", 4096, NULL, 10, NULL, 1);
 }
@@ -715,15 +741,41 @@ void loop() {
   bool mounted = tud_mounted();
   bool suspended = tud_suspended();
 
+  static bool wasMounted = false;
+  bool nowMounted = mounted && !suspended;
+  if (nowMounted && !wasMounted && selected) pendingActivate = true;
+  wasMounted = nowMounted;
+
   // USB bus lost (host powered off or wake transition)
   if (!mounted && !suspended && !grace) {
     hostSuspended = false;
+    if (busLostMs == 0) {
+      busLostMs = now;
+      sofQuiet = false;
+      sofLastFn = USB_DWC.dsts_reg.soffn;
+    }
+    uint16_t fn = USB_DWC.dsts_reg.soffn;
+    if (fn == sofLastFn) {
+      sofQuiet = true;
+    } else if (sofQuiet && sofResumeAt != busLostMs) {
+      sofResumeAt = busLostMs;
+      sofResumeMs = now;
+    }
+    sofLastFn = fn;
+    if (sofResumeMs != now && (int32_t)(now - lastRxMs) > ESPNOW_TIMEOUT_MS) {
+      reinitEspNow();
+      lastRxMs = now;
+    }
 
     if (wasSuspended) {
+      if (!wakeReplugDone && !replugWanted(busLostMs)) {
+        delay(200);
+        return;
+      }
       if (!wakeReplugDone) {
         // Confirmed sleep → immediate replug + reinit
         tud_disconnect();
-        vTaskDelay(pdMS_TO_TICKS(500));
+        vTaskDelay(pdMS_TO_TICKS(REPLUG_OFF_MS));
         tud_connect();
         reinitEspNow();
         if (wasActiveBeforeSuspend) {
@@ -764,11 +816,15 @@ void loop() {
     }
     lastPacketMs = now;
 
+    if (usbGoneSinceMs != 0 && !replugWanted(usbGoneSinceMs)) {
+      delay(200);
+      return;
+    }
     if (usbGoneSinceMs == 0) {
       usbGoneSinceMs = now;
     } else if (now - usbGoneSinceMs > USB_GONE_REPLUG_MS) {
       tud_disconnect();
-      vTaskDelay(pdMS_TO_TICKS(500));
+      vTaskDelay(pdMS_TO_TICKS(REPLUG_OFF_MS));
       tud_connect();
       usbGoneSinceMs = now;
     }
@@ -796,6 +852,7 @@ void loop() {
     }
     lastPacketMs = now;
     usbGoneSinceMs = 0;
+    busLostMs = 0;
     delay(500);
     return;
   }
@@ -803,6 +860,7 @@ void loop() {
   // Normal operation — mounted and not suspended
   hostSuspended = false;
   usbGoneSinceMs = 0;
+  busLostMs = 0;
 
   if (wasSuspended) {
     if (!wakeReplugDone) {
@@ -826,7 +884,7 @@ void loop() {
     wasActiveBeforeSuspend = false;
   }
 
-  if (!grace && (now - lastPacketMs > ESPNOW_TIMEOUT_MS)) {
+  if (!grace && ((int32_t)(now - lastPacketMs) > ESPNOW_TIMEOUT_MS)) {
     deviceActive = false;
     xQueueReset(mouseQ);
     xQueueReset(kbdQ);
